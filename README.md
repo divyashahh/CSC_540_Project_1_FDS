@@ -398,13 +398,25 @@ CSC_540_Project_1_FDS/
 │   ├── viewer.py
 │   └── view_queries.py
 │
+├── docs/
+│   ├── er_diagram_final.png    # final diagram
+│   ├── er_diagram_old.png
+│   ├── old_report.pdf
+│   └── update_para.txt         # differences between er diagram paragraph
+│
 └── sql/
     ├── schema.sql
     ├── sample_data.sql
     ├── queries.sql
     └── test_queries.sql
 ```
+## Docs
 
+- `er_diagram_final.png` – Final ER diagram reflecting improvements to the original database design.
+- `er_diagram_old.png` – Original ER diagram, included for comparison.
+- `old_report.pdf` – Previous project report.
+- `update_para.txt` – Brief explanation of the improvements and changes made between the original and final ER diagrams.
+  
 ---
 
 ## Important Notes
