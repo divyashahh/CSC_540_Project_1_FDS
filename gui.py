@@ -8,6 +8,116 @@ from app import db
 root = None
 me = {"id": None, "name": None}      # the logged-in account (access control is applied against this)
 
+# =========================================================
+# GUI THEME
+# =========================================================
+
+
+COLORS = {
+    "background": "#F5F1ED",
+    "header": "#76323F",
+    "header_hover": "#5D2631",
+    "button": "#76323F",
+    "button_hover": "#5D2631",
+    "secondary_button": "#C09F80",
+    "text": "#565656",
+    "secondary_text": "#87947B",
+    "value": "#76323F",
+    "white": "#FFFFFF",
+    "border": "#D7CEC7",
+    "selected": "#D7CEC7"
+}
+
+
+def apply_theme():
+    style = ttk.Style()
+    style.theme_use("clam")
+
+    root.configure(bg=COLORS["background"])
+
+    # General labels
+    style.configure(
+        "TLabel",
+        background=COLORS["background"],
+        foreground=COLORS["text"],
+        font=("Arial", 10)
+    )
+
+    # Main page headers
+    style.configure(
+        "Header.TLabel",
+        background=COLORS["background"],
+        foreground=COLORS["header"],
+        font=("Arial", 20, "bold")
+    )
+
+    style.configure(
+        "Subheader.TLabel",
+        background=COLORS["background"],
+        foreground=COLORS["secondary_text"],
+        font=("Arial", 11)
+    )
+
+    # Buttons
+    style.configure(
+        "TButton",
+        background=COLORS["button"],
+        foreground=COLORS["white"],
+        font=("Arial", 10, "bold"),
+        padding=(12, 7),
+        borderwidth=0
+    )
+
+    style.map(
+        "TButton",
+        background=[
+            ("active", COLORS["button_hover"]),
+            ("pressed", COLORS["header_hover"])
+        ],
+        foreground=[("disabled", COLORS["border"]),
+                    ("!disabled", COLORS["white"])]
+    )
+
+    # Entry fields
+    style.configure(
+        "TEntry",
+        fieldbackground=COLORS["white"],
+        foreground=COLORS["text"],
+        padding=5
+    )
+
+    # Dropdowns
+    style.configure(
+        "TCombobox",
+        fieldbackground=COLORS["white"],
+        foreground=COLORS["text"],
+        padding=5
+    )
+
+    # Tables
+    style.configure(
+        "Treeview",
+        background=COLORS["white"],
+        foreground=COLORS["text"],
+        fieldbackground=COLORS["white"],
+        rowheight=28,
+        font=("Arial", 10)
+    )
+
+    style.configure(
+        "Treeview.Heading",
+        background=COLORS["header"],
+        foreground=COLORS["white"],
+        font=("Arial", 10, "bold"),
+        padding=7
+    )
+
+    style.map(
+        "Treeview",
+        background=[("selected", COLORS["selected"])],
+        foreground=[("selected", COLORS["text"])]
+    )
+
 STATUS_CHOICES = {
     "Received": "RECEIVED", "In Transit": "IN_TRANSIT", "Arrived at Hub": "ARRIVED_AT_HUB",
     "Out for Delivery": "OUT_FOR_DELIVERY", "Delivered": "DELIVERED",
@@ -43,9 +153,9 @@ def clear_root():
 
 
 def create_title(text, subtitle=None):
-    ttk.Label(root, text=text, font=("Arial", 18, "bold")).pack(pady=(20, 6))
+    ttk.Label(root, text=text, style="Header.TLabel").pack(pady=(20, 6))
     if subtitle:
-        ttk.Label(root, text=subtitle, font=("Arial", 11)).pack(pady=(0, 10))
+        ttk.Label(root, text=subtitle, style="Subheader.TLabel").pack(pady=(0, 10))
 
 
 def fmt(value):
@@ -81,7 +191,7 @@ def table(columns, headings, widths, rows=(), height=None):
 
 
 def note(text, bold=False):
-    ttk.Label(root, text=text, font=("Arial", 10, "bold" if bold else "normal")).pack(pady=(8, 0))
+    ttk.Label(root, text=text, style="Note.TLabel").pack(pady=(8, 0))
 
 
 def action_bar(buttons):
@@ -1358,6 +1468,7 @@ def query6():
 def main():
     global root
     root = tk.Tk()
+    apply_theme()
     root.title("Freight Tracking and Delivery Management")
     root.geometry("1100x750")
     root.minsize(900, 650)
