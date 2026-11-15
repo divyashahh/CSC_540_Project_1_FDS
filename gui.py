@@ -1,13 +1,41 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 from app import db
+
+root = None
+me = {"id": None, "name": None}      # the logged-in account (access control is applied against this)
+
+STATUS_CHOICES = {
+    "Received": "RECEIVED", "In Transit": "IN_TRANSIT", "Arrived at Hub": "ARRIVED_AT_HUB",
+    "Out for Delivery": "OUT_FOR_DELIVERY", "Delivered": "DELIVERED",
+}
+VEHICLE_TYPES = {"Box Truck": "BOX_TRUCK", "Refrigerated Van": "REFRIGERATED_VAN", "Rail Car": "RAIL_CAR"}
+# vehicle type -> (subtype table, [(column, label, input kind)])
+TYPE_DETAILS = {
+    "BOX_TRUCK": ("box_truck", [("cargo_volume_m3", "Cargo Volume (m3)", "dec"),
+                                ("gross_weight_rating_kg", "Gross Weight Rating (kg)", "dec")]),
+    "REFRIGERATED_VAN": ("refrigerated_van", [("min_temperature_c", "Minimum Temperature (C)", "dec_any"),
+                                              ("max_temperature_c", "Maximum Temperature (C)", "dec_any"),
+                                              ("payload_limit_kg", "Payload Limit (kg)", "dec")]),
+    "RAIL_CAR": ("rail_car", [("axle_count", "Axle Count", "id"),
+                              ("track_gauge_mm", "Track Gauge (mm)", "dec")]),
+}
+
+
+class Rejected(Exception):
+    """A business-rule failure (ownership, state, ...) that should be shown to the user."""
 
 
 # =========================================================
 # GENERAL HELPERS
 # =========================================================
+
+def err_text(e):
+    return getattr(e, "msg", None) or str(e)
+
 
 def clear_root():
     for widget in root.winfo_children():
@@ -15,4041 +43,1269 @@ def clear_root():
 
 
 def create_title(text, subtitle=None):
-    ttk.Label(
-        root,
-        text=text,
-        font=("Arial", 18, "bold")
-    ).pack(pady=(25, 8))
-
+    ttk.Label(root, text=text, font=("Arial", 18, "bold")).pack(pady=(20, 6))
     if subtitle:
-        ttk.Label(
-            root,
-            text=subtitle,
-            font=("Arial", 11)
-        ).pack(pady=(0, 15))
+        ttk.Label(root, text=subtitle, font=("Arial", 11)).pack(pady=(0, 10))
 
 
-def create_tree(parent, columns, headings, widths=None):
-    tree = ttk.Treeview(
-        parent,
-        columns=columns,
-        show="headings"
-    )
+def fmt(value):
+    return "-" if value is None else value
 
+
+def create_tree(parent, columns, headings, widths=None, height=8):
+    tree = ttk.Treeview(parent, columns=columns, show="headings", height=height)
     for i, column in enumerate(columns):
         tree.heading(column, text=headings[i])
-        tree.column(
-            column,
-            width=widths[i] if widths else 120,
-            anchor="center"
-        )
-
-    scrollbar = ttk.Scrollbar(
-        parent,
-        orient="vertical",
-        command=tree.yview
-    )
-
+        tree.column(column, width=widths[i] if widths else 120, anchor="center")
+    scrollbar = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=scrollbar.set)
-
-    tree.pack(
-        side="left",
-        fill="both",
-        expand=True
-    )
-
-    scrollbar.pack(
-        side="right",
-        fill="y"
-    )
-
+    tree.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
     return tree
 
 
-def show_rows(
-    title,
-    columns,
-    headings,
-    rows,
-    widths=None,
-    back_command=None
-):
-    clear_root()
-
-    create_title(title)
-
-    frame = ttk.Frame(root)
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=20,
-        pady=10
-    )
-
-    tree = create_tree(
-        frame,
-        columns,
-        headings,
-        widths
-    )
-
+def fill_tree(tree, rows):
+    tree.delete(*tree.get_children())
     for row in rows:
-        tree.insert("", "end", values=row)
+        tree.insert("", "end", values=[fmt(v) for v in row])
 
-    ttk.Button(
-        root,
-        text="Back",
-        command=back_command or show_home,
-        width=25
-    ).pack(pady=15)
+
+def table(columns, headings, widths, rows=(), height=None):
+    """Result tables (no height given) stretch to fill the window; reference tables keep a fixed
+    number of rows so the buttons below them always stay visible."""
+    frame = ttk.Frame(root)
+    frame.pack(fill="both", expand=height is None, padx=20, pady=6)
+    tree = create_tree(frame, columns, headings, widths, height or 8)
+    fill_tree(tree, rows)
+    return tree
+
+
+def note(text, bold=False):
+    ttk.Label(root, text=text, font=("Arial", 10, "bold" if bold else "normal")).pack(pady=(8, 0))
+
+
+def action_bar(buttons):
+    """Numbered buttons exactly like the flow document: '1. Save', '2. Cancel', ..."""
+    for i, (label, command) in enumerate(buttons, 1):
+        ttk.Button(root, text=f"{i}. {label}", command=command, width=30).pack(pady=3)
+
+
+def menu_page(heading, subtitle, items):
+    clear_root()
+    create_title(heading, subtitle)
+    action_bar(items)
 
 
 def get_hubs():
-    _, rows = db.query(
-        "SELECT hub_id FROM hub ORDER BY hub_id"
-    )
-    return [row[0] for row in rows]
+    _, rows = db.query("SELECT hub_id FROM hub ORDER BY hub_id")
+    return [r[0] for r in rows]
 
 
-def valid_datetime(value):
+def run_action(action, ok_title, error_title, back):
+    """Run the database operation and navigate only if it succeeds."""
     try:
-        return datetime.strptime(
-            value,
-            "%Y-%m-%d %H:%M"
-        ).strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        raise ValueError(
-            "Use date/time format YYYY-MM-DD HH:MM."
-        )
+        result = action()
+        messagebox.showinfo(ok_title, result)
+    except Rejected as e:
+        messagebox.showerror("Not Allowed", str(e))
+        return
+    except Exception as e:
+        messagebox.showerror(error_title, err_text(e))
+        return
 
+    # Only navigate away after a successful operation.
+    back()
 
-def valid_date(value):
+# ---------- input validation (every parser raises ValueError with a readable message) ----------
+
+def parse_int(text, label, minimum=1):
     try:
-        return datetime.strptime(
-            value,
-            "%Y-%m-%d"
-        ).strftime("%Y-%m-%d")
+        n = int(text)
     except ValueError:
-        raise ValueError(
-            "Use date format YYYY-MM-DD."
-        )
+        raise ValueError(f"{label} must be a whole number.")
+    if n < minimum:
+        raise ValueError(f"{label} must be at least {minimum}.")
+    return n
+
+
+def parse_decimal(text, label, positive=True):
+    try:
+        n = Decimal(text)
+        if not n.is_finite():
+            raise InvalidOperation
+    except InvalidOperation:
+        raise ValueError(f"{label} must be a number.")
+    if positive and n <= 0:
+        raise ValueError(f"{label} must be greater than 0.")
+    return n
+
+
+def parse_date(text, label):
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"{label} must use the format YYYY-MM-DD.")
+
+
+def parse_datetime(text, label):
+    for fmt_ in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt_)
+        except ValueError:
+            pass
+    raise ValueError(f"{label} must use the format YYYY-MM-DD HH:MM.")
+
+
+def parse_hub(text, label):
+    hubs = get_hubs()
+    code = text.upper()
+    if code not in hubs:
+        raise ValueError(f"{label} '{text}' is not a valid hub. Valid hubs: {', '.join(hubs)}")
+    return code
+
+
+PARSERS = {
+    "text": lambda t, l: t,
+    "password": lambda t, l: t,
+    "choice": lambda t, l: t,
+    "id": lambda t, l: parse_int(t, l, 1),
+    "n": lambda t, l: parse_int(t, l, 0),
+    "dec": lambda t, l: parse_decimal(t, l, True),
+    "dec_any": lambda t, l: parse_decimal(t, l, False),
+    "date": parse_date,
+    "datetime": parse_datetime,
+    "hub": parse_hub,
+}
+
+
+def build_form(specs):
+    """specs: (key, label, kind[, default[, options]]). Returns {key: (widget, kind, label)}.
+    Kinds ending in _opt are optional (blank -> None)."""
+    frame = ttk.Frame(root)
+    frame.pack(pady=8)
+    widgets = {}
+    for i, spec in enumerate(specs):
+        key, label, kind = spec[0], spec[1], spec[2]
+        default = spec[3] if len(spec) > 3 else ""
+        options = spec[4] if len(spec) > 4 else None
+        ttk.Label(frame, text=label).grid(row=i, column=0, padx=10, pady=5, sticky="e")
+        if kind.startswith("choice"):
+            widget = ttk.Combobox(frame, values=options, state="readonly", width=28)
+            if default:
+                widget.set(default)
+        else:
+            widget = ttk.Entry(frame, width=31, show="*" if kind == "password" else "")
+            if default != "":
+                widget.insert(0, str(default))
+        widget.grid(row=i, column=1, padx=10, pady=5)
+        widgets[key] = (widget, kind, label)
+    return widgets
+
+
+def read_form(widgets):
+    """Validate every field; raises ValueError (message names the field) so the page can re-prompt."""
+    values = {}
+    for key, (widget, kind, label) in widgets.items():
+        text = widget.get() if kind == "password" else widget.get().strip()
+        optional = kind.endswith("_opt")
+        base = kind[:-4] if optional else kind
+        if text == "":
+            if optional:
+                values[key] = None
+                continue
+            raise ValueError(f"{label} is required.")
+        values[key] = PARSERS[base](text, label)
+    return values
+
+
+def set_entry(widget, value):
+    if isinstance(widget, ttk.Combobox):
+        widget.set(str(value))
+    else:
+        widget.delete(0, tk.END)
+        widget.insert(0, str(value))
+
+
+def date_range(v):
+    start, end = v["start"], v["end"]
+    if start > end:
+        raise ValueError("Start Date must not be after End Date.")
+    return start, end
+
+
+DATE_SPECS = [("start", "Start Date (YYYY-MM-DD)", "date", "2026-01-01"),
+              ("end", "End Date (YYYY-MM-DD)", "date", date.today().isoformat())]
+
+
+def report_page(heading, specs, run, columns, headings, widths, back, landing,
+                run_label="View Report", back_label="GoBack", landing_label="LandingPage"):
+    """Form -> run(values) -> (rows, summary text) shown below. With no form fields the report
+    is shown immediately and only the navigation buttons remain (as in the flow document)."""
+    clear_root()
+    create_title(heading)
+    widgets = build_form(specs) if specs else {}
+    summary = ttk.Label(root, text="", font=("Arial", 11, "bold"))
+    summary.pack(pady=4)
+    tree = table(columns, headings, widths)
+
+    def view():
+        try:
+            values = read_form(widgets) if widgets else {}
+            rows, text = run(values)
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
+        except Rejected as e:
+            messagebox.showerror("Not Allowed", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("Report Error", err_text(e))
+            return
+        fill_tree(tree, rows)
+        summary.config(text=text if rows or text else "")
+        if not rows and not text:
+            summary.config(text="No matching rows.")
+
+    buttons = [(run_label, view)] if widgets else []
+    action_bar(buttons + [(back_label, back), (landing_label, landing)])
+    if not widgets:
+        view()
+
+
+def tracking_page(heading, owner_only, back, landing):
+    """Shared by Shipper: Track Shipment (own shipments only) and Viewer: Track Shipment (read-only)."""
+    clear_root()
+    create_title(heading)
+    widgets = build_form([("sid", "Shipment ID", "id")])
+    info = ttk.Label(root, text="", justify="left", font=("Arial", 11))
+    info.pack(pady=8)
+    tree = table(("seq", "time", "hub", "status"), ("Seq", "Timestamp", "Hub", "Status"), (60, 190, 80, 170))
+
+    def view():
+        try:
+            v = read_form(widgets)
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
+        sql = ("SELECT s.shipment_id, sh.shipper_name, s.origin_hub_id, s.destination_hub_id, s.weight_kg, "
+               "s.promised_delivery_date, COALESCE(s.current_status, 'NO SCANS YET'), "
+               "COALESCE(s.delivery_outcome, '-') FROM shipment s "
+               "JOIN shipper sh ON sh.account_id = s.shipper_id WHERE s.shipment_id = %s")
+        params = [v["sid"]]
+        if owner_only:
+            sql += " AND s.shipper_id = %s"
+            params.append(me["id"])
+        try:
+            _, rows = db.query(sql, params)
+            if not rows:
+                info.config(text="")
+                fill_tree(tree, [])
+                messagebox.showerror("Not Found", "That shipment does not exist"
+                                     + (" or is not owned by you." if owner_only else "."))
+                return
+            r = rows[0]
+            info.config(text=(f"Shipment {r[0]}   Shipper: {r[1]}\nRoute: {r[2]} -> {r[3]}   Weight: {r[4]} kg\n"
+                              f"Promised: {r[5]}\nCurrent Status: {r[6]}   Delivery Outcome: {r[7]}"))
+            _, scans = db.query("SELECT scan_sequence_no, scan_timestamp, hub_id, status FROM scan_event "
+                                "WHERE shipment_id = %s ORDER BY scan_sequence_no", (v["sid"],))
+            fill_tree(tree, scans)
+        except Exception as e:
+            messagebox.showerror("Tracking Error", err_text(e))
+
+    action_bar([("View History", view), ("GoBack", back), ("LandingPage", landing)])
+
+
+DWELL_SQL = """
+SELECT shipment_id, scan_sequence_no, status, hub_id, scan_timestamp,
+       LAG(scan_timestamp) OVER w AS previous_scan_time,
+       LAG(hub_id) OVER w AS previous_hub,
+       TIMESTAMPDIFF(MINUTE, LAG(scan_timestamp) OVER w, scan_timestamp) AS minutes_since_previous,
+       ROUND(TIMESTAMPDIFF(MINUTE, LAG(scan_timestamp) OVER w, scan_timestamp) / 60, 2) AS hours_since_previous
+FROM scan_event
+WHERE shipment_id = %s
+WINDOW w AS (PARTITION BY shipment_id ORDER BY scan_sequence_no)
+ORDER BY scan_sequence_no
+"""
+DWELL_COLS = (("shipment", "seq", "status", "hub", "time", "prevtime", "prevhub", "minutes", "hours"),
+              ("Shipment", "Seq", "Status", "Hub", "Timestamp", "Previous Time", "Previous Hub", "Minutes", "Hours"),
+              (80, 50, 140, 60, 150, 150, 100, 80, 70))
 
 
 # =========================================================
-# HOME SCREEN
+# HOME + LOGIN
 # =========================================================
 
 def show_home():
-    clear_root()
+    me.update(id=None, name=None)
+    menu_page("Freight Tracking and Delivery Management", "Select an option", [
+        ("Shipper Login", lambda: show_login("Shipper")),
+        ("Carrier Login", lambda: show_login("Carrier")),
+        ("Viewer Login", lambda: show_login("Viewer")),
+        ("Exit", root.destroy),
+    ])
 
-    create_title(
-        "Freight Tracking and Delivery Management",
-        "Select a role"
-    )
-
-    ttk.Button(
-        root,
-        text="Shipper",
-        command=lambda: show_login("Shipper"),
-        width=30
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="Carrier",
-        command=lambda: show_login("Carrier"),
-        width=30
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="Viewer",
-        command=lambda: show_login("Viewer"),
-        width=30
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="View Queries",
-        command=show_queries_menu,
-        width=30
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="Exit",
-        command=root.destroy,
-        width=30
-    ).pack(pady=25)
-
-
-# =========================================================
-# LOGIN
-# =========================================================
 
 def show_login(role):
     clear_root()
-
     create_title(f"{role} Login")
+    widgets = build_form([("user", "User ID", "text"), ("pw", "Password", "password")])
+    landing = {"Shipper": shipper_landing, "Carrier": carrier_landing, "Viewer": viewer_landing}[role]
 
-    form = ttk.Frame(root)
-    form.pack(pady=10)
-
-    ttk.Label(
-        form,
-        text="Username"
-    ).grid(
-        row=0,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    username_entry = ttk.Entry(
-        form,
-        width=30
-    )
-    username_entry.grid(
-        row=0,
-        column=1,
-        padx=10,
-        pady=10
-    )
-
-    ttk.Label(
-        form,
-        text="Password"
-    ).grid(
-        row=1,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    password_entry = ttk.Entry(
-        form,
-        width=30,
-        show="*"
-    )
-    password_entry.grid(
-        row=1,
-        column=1,
-        padx=10,
-        pady=10
-    )
-
-    def attempt_login():
-        username = username_entry.get().strip()
-        password = password_entry.get()
-
-        if not username or not password:
-            messagebox.showwarning(
-                "Missing Information",
-                "Enter both username and password."
-            )
+    def sign_in():
+        user = widgets["user"][0].get().strip()
+        password = widgets["pw"][0].get()
+        if not user or not password:
+            messagebox.showwarning("Missing Information", "Enter both User ID and Password.")
             return
-
         try:
             _, rows = db.query(
-                """
-                SELECT
-                    a.account_id,
-                    COALESCE(
-                        c.carrier_name,
-                        s.shipper_name,
-                        a.username
-                    )
-                FROM user_account a
-                LEFT JOIN carrier c
-                    ON c.account_id = a.account_id
-                LEFT JOIN shipper s
-                    ON s.account_id = a.account_id
-                WHERE a.username = %s
-                  AND a.password_hash = SHA2(%s, 256)
-                  AND a.role = %s
-                """,
-                (username, password, role)
-            )
-
-            if not rows:
-                messagebox.showerror(
-                    "Login Failed",
-                    "Invalid username or password for this role."
-                )
-                return
-
-            account_id, display_name = rows[0]
-
-            if role == "Shipper":
-                show_shipper_dashboard(
-                    account_id,
-                    display_name
-                )
-
-            elif role == "Carrier":
-                show_carrier_dashboard(
-                    account_id,
-                    display_name
-                )
-
-            else:
-                show_viewer_dashboard(
-                    account_id,
-                    display_name
-                )
-
+                "SELECT a.account_id, COALESCE(c.carrier_name, s.shipper_name, a.username) "
+                "FROM user_account a LEFT JOIN carrier c ON c.account_id = a.account_id "
+                "LEFT JOIN shipper s ON s.account_id = a.account_id "
+                "WHERE a.username = %s AND a.password_hash = SHA2(%s, 256) AND a.role = %s",
+                (user, password, role))
         except Exception as e:
-            messagebox.showerror(
-                "Database Error",
-                str(e)
-            )
+            messagebox.showerror("Database Error", err_text(e))
+            return
+        if not rows:
+            messagebox.showerror("Login Incorrect", "Login Incorrect. Please enter your credentials again.")
+            widgets["pw"][0].delete(0, tk.END)
+            return
+        me.update(id=rows[0][0], name=rows[0][1])
+        landing()
 
-    ttk.Button(
-        root,
-        text="Login",
-        command=attempt_login,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=show_home,
-        width=25
-    ).pack()
+    widgets["pw"][0].bind("<Return>", lambda e: sign_in())
+    action_bar([("Sign-In", sign_in), ("GoBack", show_home)])
 
 
 # =========================================================
-# SHIPPER DASHBOARD
+# SHIPPER
 # =========================================================
 
-def show_shipper_dashboard(account_id, display_name):
+MY_SHIPMENTS_SQL = (
+    "SELECT s.shipment_id, s.origin_hub_id, s.destination_hub_id, s.weight_kg, s.promised_delivery_date, "
+    "COALESCE(s.current_status, 'NO SCANS YET'), b.departure_id "
+    "FROM shipment s LEFT JOIN booking b ON b.shipment_id = s.shipment_id "
+    "WHERE s.shipper_id = %s ORDER BY s.shipment_id")
+MY_SHIPMENTS_COLS = (("id", "origin", "dest", "weight", "promised", "status", "dep"),
+                     ("Shipment", "Origin", "Destination", "Weight kg", "Promised", "Status", "Departure"),
+                     (80, 80, 100, 90, 110, 140, 90))
+
+
+def shipper_landing():
+    menu_page(f"Welcome, {me['name']}", "Shipper: Landing", [
+        ("Manage Shipments", shipper_manage),
+        ("Reports", shipper_reports_menu),
+        ("Logout", show_home),
+    ])
+
+
+def shipper_manage():
+    menu_page("Manage Shipments", "Shipper: Manage Shipments", [
+        ("Create Shipment", shipper_create),
+        ("Update Shipment", shipper_update),
+        ("Book Shipment onto Departure", shipper_book),
+        ("Track Shipment", shipper_track),
+        ("GoBack", shipper_landing),
+        ("LandingPage", shipper_landing),
+    ])
+
+
+def shipper_create():
     clear_root()
-
-    create_title(
-        f"Welcome, {display_name}",
-        "Shipper Dashboard"
-    )
-
-    options = [
-        (
-            "List My Shipments",
-            lambda: show_shipper_shipments(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Create Shipment",
-            lambda: show_create_shipment(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Update Shipment",
-            lambda: show_update_shipment(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Book Shipment",
-            lambda: show_book_shipment(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Track Shipment",
-            lambda: show_track_shipment(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Reports",
-            lambda: show_shipper_reports(
-                account_id,
-                display_name
-            )
-        )
-    ]
-
-    for label, command in options:
-        ttk.Button(
-            root,
-            text=label,
-            command=command,
-            width=32
-        ).pack(pady=7)
-
-    ttk.Button(
-        root,
-        text="Logout",
-        command=show_home,
-        width=32
-    ).pack(pady=20)
-
-
-# =========================================================
-# SHIPPER - LIST
-# =========================================================
-
-def show_shipper_shipments(account_id, display_name):
-    try:
-        _, rows = db.query(
-            """
-            SELECT
-                s.shipment_id,
-                s.origin_hub_id,
-                s.destination_hub_id,
-                s.weight_kg,
-                s.promised_delivery_date,
-                COALESCE(
-                    s.current_status,
-                    'NO SCANS'
-                ),
-                COALESCE(
-                    s.delivery_outcome,
-                    '-'
-                ),
-                COALESCE(
-                    b.departure_id,
-                    '-'
-                )
-            FROM shipment s
-            LEFT JOIN booking b
-                ON b.shipment_id = s.shipment_id
-            WHERE s.shipper_id = %s
-            ORDER BY s.shipment_id
-            """,
-            (account_id,)
-        )
-
-        show_rows(
-            "My Shipments",
-            (
-                "id",
-                "origin",
-                "destination",
-                "weight",
-                "promised",
-                "status",
-                "outcome",
-                "departure"
-            ),
-            (
-                "ID",
-                "Origin",
-                "Destination",
-                "Weight",
-                "Promised",
-                "Status",
-                "Outcome",
-                "Departure"
-            ),
-            rows,
-            (50, 70, 90, 80, 100, 120, 90, 80),
-            lambda: show_shipper_dashboard(
-                account_id,
-                display_name
-            )
-        )
-
-    except Exception as e:
-        messagebox.showerror(
-            "Database Error",
-            str(e)
-        )
-
-
-# =========================================================
-# SHIPPER - CREATE
-# =========================================================
-
-def show_create_shipment(account_id, display_name):
-    clear_root()
-
     create_title("Create Shipment")
+    w = build_form([("origin", "Origin Hub ID", "hub"), ("dest", "Destination Hub ID", "hub"),
+                    ("weight", "Weight (kg)", "dec"), ("promised", "Promised Delivery Date (YYYY-MM-DD)", "date")])
+    note("Hubs: " + ", ".join(get_hubs()))
 
-    hubs = get_hubs()
-
-    form = ttk.Frame(root)
-    form.pack(pady=15)
-
-    ttk.Label(
-        form,
-        text="Origin Hub"
-    ).grid(
-        row=0,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    origin_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly"
-    )
-    origin_box.grid(row=0, column=1)
-
-    ttk.Label(
-        form,
-        text="Destination Hub"
-    ).grid(
-        row=1,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    destination_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly"
-    )
-    destination_box.grid(row=1, column=1)
-
-    ttk.Label(
-        form,
-        text="Weight (kg)"
-    ).grid(
-        row=2,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    weight_entry = ttk.Entry(form)
-    weight_entry.grid(row=2, column=1)
-
-    ttk.Label(
-        form,
-        text="Promised Date"
-    ).grid(
-        row=3,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    date_entry = ttk.Entry(form)
-    date_entry.grid(row=3, column=1)
-
-    ttk.Label(
-        form,
-        text="YYYY-MM-DD"
-    ).grid(row=4, column=1)
-
-    def create():
-        origin = origin_box.get()
-        destination = destination_box.get()
-        weight_text = weight_entry.get().strip()
-        promised = date_entry.get().strip()
-
-        if not all(
-            (
-                origin,
-                destination,
-                weight_text,
-                promised
-            )
-        ):
-            messagebox.showwarning(
-                "Missing Information",
-                "Fill out every field."
-            )
-            return
-
-        if origin == destination:
-            messagebox.showerror(
-                "Invalid Shipment",
-                "Origin and destination must differ."
-            )
-            return
-
+    def save():
         try:
-            weight = float(weight_text)
+            v = read_form(w)
+            if v["origin"] == v["dest"]:
+                raise ValueError("Origin and destination hubs must be different.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
 
-            if weight <= 0:
-                raise ValueError(
-                    "Weight must be greater than 0."
-                )
-
-            promised = valid_date(promised)
-
+        def action():
             new_id = db.execute(
-                """
-                INSERT INTO shipment (
-                    shipper_id,
-                    origin_hub_id,
-                    destination_hub_id,
-                    weight_kg,
-                    promised_delivery_date
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    account_id,
-                    origin,
-                    destination,
-                    weight,
-                    promised
-                )
-            )
+                "INSERT INTO shipment (shipper_id, origin_hub_id, destination_hub_id, weight_kg, "
+                "promised_delivery_date) VALUES (%s, %s, %s, %s, %s)",
+                (me["id"], v["origin"], v["dest"], v["weight"], v["promised"]))
+            return (f"Shipment {new_id} was created: {v['origin']} -> {v['dest']}, "
+                    f"{v['weight']} kg, promised {v['promised']}.")
+        run_action(action, "Shipment Created", "Create Shipment Failed", shipper_manage)
 
-            messagebox.showinfo(
-                "Shipment Created",
-                f"Shipment {new_id} was created."
-            )
-
-            show_shipper_shipments(
-                account_id,
-                display_name
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Create Shipment Failed",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Create Shipment",
-        command=create,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_shipper_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack()
+    action_bar([("Save", save), ("Cancel", shipper_manage), ("LandingPage", shipper_landing)])
 
 
-# =========================================================
-# SHIPPER - UPDATE
-# =========================================================
-
-def show_update_shipment(account_id, display_name):
+def shipper_update():
     clear_root()
-
     create_title("Update Shipment")
+    w = build_form([("sid", "Shipment ID", "id"), ("origin", "Origin Hub ID", "hub"),
+                    ("dest", "Destination Hub ID", "hub"), ("weight", "Weight (kg)", "dec"),
+                    ("promised", "Promised Delivery Date (YYYY-MM-DD)", "date")])
+    note("Enter a Shipment ID and press Tab to load its current values. Only unbooked shipments can be changed.")
+    cols = MY_SHIPMENTS_COLS
+    table(cols[0], cols[1], cols[2], db.query(MY_SHIPMENTS_SQL, (me["id"],))[1], height=6)
 
-    _, rows = db.query(
-        """
-        SELECT shipment_id
-        FROM shipment s
-        WHERE shipper_id = %s
-          AND NOT EXISTS (
-              SELECT 1
-              FROM booking b
-              WHERE b.shipment_id = s.shipment_id
-          )
-        ORDER BY shipment_id
-        """,
-        (account_id,)
-    )
-
-    shipment_ids = [
-        str(row[0])
-        for row in rows
-    ]
-
-    if not shipment_ids:
-        messagebox.showinfo(
-            "No Shipments",
-            "No unbooked shipments are available."
-        )
-        show_shipper_dashboard(
-            account_id,
-            display_name
-        )
-        return
-
-    hubs = get_hubs()
-
-    form = ttk.Frame(root)
-    form.pack(pady=15)
-
-    labels = [
-        "Shipment ID",
-        "Origin Hub",
-        "Destination Hub",
-        "Weight (kg)",
-        "Promised Date"
-    ]
-
-    for i, label in enumerate(labels):
-        ttk.Label(
-            form,
-            text=label
-        ).grid(
-            row=i,
-            column=0,
-            padx=10,
-            pady=8
-        )
-
-    shipment_box = ttk.Combobox(
-        form,
-        values=shipment_ids,
-        state="readonly"
-    )
-    shipment_box.grid(row=0, column=1)
-
-    origin_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly"
-    )
-    origin_box.grid(row=1, column=1)
-
-    destination_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly"
-    )
-    destination_box.grid(row=2, column=1)
-
-    weight_entry = ttk.Entry(form)
-    weight_entry.grid(row=3, column=1)
-
-    date_entry = ttk.Entry(form)
-    date_entry.grid(row=4, column=1)
-
-    def load(event=None):
-        sid = shipment_box.get()
-
-        if not sid:
-            return
-
-        _, data = db.query(
-            """
-            SELECT
-                origin_hub_id,
-                destination_hub_id,
-                weight_kg,
-                promised_delivery_date
-            FROM shipment
-            WHERE shipment_id = %s
-              AND shipper_id = %s
-            """,
-            (sid, account_id)
-        )
-
-        if not data:
-            return
-
-        row = data[0]
-
-        origin_box.set(row[0])
-        destination_box.set(row[1])
-
-        weight_entry.delete(0, tk.END)
-        weight_entry.insert(0, row[2])
-
-        date_entry.delete(0, tk.END)
-        date_entry.insert(0, row[3])
-
-    shipment_box.bind(
-        "<<ComboboxSelected>>",
-        load
-    )
-
-    def update():
-        sid = shipment_box.get()
-        origin = origin_box.get()
-        destination = destination_box.get()
-
-        if not sid:
-            messagebox.showwarning(
-                "Select Shipment",
-                "Choose a shipment first."
-            )
-            return
-
-        if origin == destination:
-            messagebox.showerror(
-                "Invalid Route",
-                "Origin and destination must differ."
-            )
-            return
-
+    def prefill(event=None):
         try:
-            weight = float(
-                weight_entry.get().strip()
-            )
+            text = w["sid"][0].get().strip()
+            if not text.isdigit():
+                return
+            _, rows = db.query("SELECT origin_hub_id, destination_hub_id, weight_kg, promised_delivery_date "
+                               "FROM shipment WHERE shipment_id = %s AND shipper_id = %s", (int(text), me["id"]))
+            if rows:
+                for key, value in zip(("origin", "dest", "weight", "promised"), rows[0]):
+                    set_entry(w[key][0], value)
+        except tk.TclError:
+            pass
 
-            if weight <= 0:
-                raise ValueError(
-                    "Weight must be greater than 0."
-                )
+    w["sid"][0].bind("<FocusOut>", prefill)
 
-            promised = valid_date(
-                date_entry.get().strip()
-            )
+    def save():
+        try:
+            v = read_form(w)
+            if v["origin"] == v["dest"]:
+                raise ValueError("Origin and destination hubs must be different.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
 
-            db.execute(
-                """
-                UPDATE shipment
-                SET origin_hub_id = %s,
-                    destination_hub_id = %s,
-                    weight_kg = %s,
-                    promised_delivery_date = %s
-                WHERE shipment_id = %s
-                  AND shipper_id = %s
-                """,
-                (
-                    origin,
-                    destination,
-                    weight,
-                    promised,
-                    sid,
-                    account_id
-                )
-            )
+        def action():
+            if not db.query("SELECT 1 FROM shipment WHERE shipment_id = %s AND shipper_id = %s",
+                            (v["sid"], me["id"]))[1]:
+                raise Rejected("That shipment does not exist or is not owned by you.")
+            # Application-level rule: changing weight/lane of a booked shipment could overbook a departure.
+            if db.query("SELECT 1 FROM booking WHERE shipment_id = %s", (v["sid"],))[1]:
+                raise Rejected("This shipment is already booked onto a departure and can no longer be updated.")
+            db.execute("UPDATE shipment SET origin_hub_id = %s, destination_hub_id = %s, weight_kg = %s, "
+                       "promised_delivery_date = %s WHERE shipment_id = %s AND shipper_id = %s",
+                       (v["origin"], v["dest"], v["weight"], v["promised"], v["sid"], me["id"]))
+            return f"Shipment {v['sid']} was updated."
+        run_action(action, "Shipment Updated", "Update Shipment Failed", shipper_manage)
 
-            messagebox.showinfo(
-                "Updated",
-                f"Shipment {sid} was updated."
-            )
-
-            show_shipper_shipments(
-                account_id,
-                display_name
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Update Failed",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Update Shipment",
-        command=update,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_shipper_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack()
+    action_bar([("Save", save), ("Cancel", shipper_manage), ("LandingPage", shipper_landing)])
 
 
-# =========================================================
-# SHIPPER - BOOK
-# =========================================================
-
-def show_book_shipment(account_id, display_name):
+def shipper_book():
     clear_root()
-
-    create_title("Book Shipment")
-
-    _, rows = db.query(
-        """
-        SELECT shipment_id
-        FROM shipment s
-        WHERE shipper_id = %s
-          AND NOT EXISTS (
-              SELECT 1
-              FROM booking b
-              WHERE b.shipment_id = s.shipment_id
-          )
-        ORDER BY shipment_id
-        """,
-        (account_id,)
-    )
-
-    shipment_ids = [
-        str(row[0])
-        for row in rows
-    ]
-
-    if not shipment_ids:
-        messagebox.showinfo(
-            "No Shipments",
-            "You have no unbooked shipments."
-        )
-        show_shipper_dashboard(
-            account_id,
-            display_name
-        )
-        return
-
-    ttk.Label(
-        root,
-        text="Select Shipment"
-    ).pack(pady=5)
-
-    shipment_box = ttk.Combobox(
-        root,
-        values=shipment_ids,
-        state="readonly",
-        width=25
-    )
-    shipment_box.pack()
-
-    status_label = ttk.Label(
-        root,
-        text=""
-    )
-    status_label.pack(pady=5)
-
-    frame = ttk.Frame(root)
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=20,
-        pady=15
-    )
-
-    tree = create_tree(
-        frame,
-        (
-            "id",
-            "origin",
-            "dest",
-            "time",
-            "remaining"
-        ),
-        (
-            "Departure",
-            "Origin",
-            "Destination",
-            "Date/Time",
-            "Remaining kg"
-        ),
-        (80, 70, 90, 150, 100)
-    )
-
-    def load_departures(event=None):
-        for item in tree.get_children():
-            tree.delete(item)
-
-        sid = shipment_box.get()
-
-        if not sid:
-            return
-
-        _, shipment = db.query(
-            """
-            SELECT
-                origin_hub_id,
-                destination_hub_id,
-                weight_kg
-            FROM shipment
-            WHERE shipment_id = %s
-              AND shipper_id = %s
-            """,
-            (sid, account_id)
-        )
-
-        if not shipment:
-            return
-
-        origin, dest, weight = shipment[0]
-
-        _, departures = db.query(
-            """
-            SELECT
-                departure_id,
-                origin_hub_id,
-                destination_hub_id,
-                departure_datetime,
-                remaining_kg
-            FROM v_departure_load
-            WHERE origin_hub_id = %s
-              AND destination_hub_id = %s
-              AND remaining_kg >= %s
-            ORDER BY departure_datetime
-            """,
-            (origin, dest, weight)
-        )
-
-        for row in departures:
-            tree.insert(
-                "",
-                "end",
-                values=row
-            )
-
-        if departures:
-            status_label.config(
-                text=(
-                    f"Eligible departures for "
-                    f"{origin} → {dest}, {weight} kg"
-                )
-            )
-        else:
-            status_label.config(
-                text=(
-                    "No eligible departures currently "
-                    "have the correct lane and capacity."
-                )
-            )
-
-    shipment_box.bind(
-        "<<ComboboxSelected>>",
-        load_departures
-    )
+    create_title("Book Shipment onto Departure")
+    w = build_form([("sid", "Shipment ID", "id"), ("did", "Departure ID", "id")])
+    note("Your unbooked shipments", bold=True)
+    table(("id", "origin", "dest", "weight", "promised"),
+          ("Shipment", "Origin", "Destination", "Weight kg", "Promised"), (90, 90, 110, 100, 120),
+          db.query("SELECT s.shipment_id, s.origin_hub_id, s.destination_hub_id, s.weight_kg, "
+                   "s.promised_delivery_date FROM shipment s WHERE s.shipper_id = %s AND NOT EXISTS "
+                   "(SELECT 1 FROM booking b WHERE b.shipment_id = s.shipment_id) ORDER BY s.shipment_id",
+                   (me["id"],))[1], height=4)
+    note("Departures on the same lanes (remaining capacity)", bold=True)
+    table(("dep", "origin", "dest", "time", "remaining"),
+          ("Departure", "Origin", "Destination", "Date/Time", "Remaining kg"), (90, 80, 100, 160, 110),
+          db.query("SELECT DISTINCT l.departure_id, l.origin_hub_id, l.destination_hub_id, "
+                   "l.departure_datetime, l.remaining_kg FROM v_departure_load l "
+                   "JOIN shipment s ON s.origin_hub_id = l.origin_hub_id "
+                   "AND s.destination_hub_id = l.destination_hub_id "
+                   "WHERE s.shipper_id = %s AND NOT EXISTS "
+                   "(SELECT 1 FROM booking b WHERE b.shipment_id = s.shipment_id) "
+                   "ORDER BY l.departure_datetime", (me["id"],))[1], height=5)
 
     def book():
-        selected = tree.selection()
-
-        if not selected:
-            messagebox.showwarning(
-                "Select Departure",
-                "Choose a departure from the table."
-            )
+        try:
+            v = read_form(w)
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
             return
 
-        sid = int(shipment_box.get())
+        def action():
+            if not db.query("SELECT 1 FROM shipment WHERE shipment_id = %s AND shipper_id = %s",
+                            (v["sid"], me["id"]))[1]:
+                raise Rejected("That shipment does not exist or is not owned by you.")
+            # The stored procedure checks the lane and the capacity atomically.
+            results = db.call_proc("book_shipment", (v["sid"], v["did"]))
+            load = ""
+            if results and results[0][1]:
+                row = results[0][1][0]
+                load = f"\nDeparture load is now {row[2]} of {row[3]} kg."
+            return f"Shipment {v['sid']} was booked onto departure {v['did']}.{load}"
+        run_action(action, "Booking Successful", "Booking Rejected", shipper_manage)
 
-        departure_id = int(
-            tree.item(
-                selected[0]
-            )["values"][0]
-        )
+    action_bar([("Book", book), ("Cancel", shipper_manage), ("LandingPage", shipper_landing)])
 
+
+def shipper_track():
+    tracking_page("Track Shipment", True, shipper_manage, shipper_landing)
+
+
+def shipper_reports_menu():
+    menu_page("Reports", "Shipper: Reports", [
+        ("On-Time vs Late Summary", shipper_ontime_report),
+        ("In-Transit Shipments", shipper_intransit_report),
+        ("Shipments Near Promise Date", shipper_near_promise_report),
+        ("GoBack", shipper_landing),
+        ("LandingPage", shipper_landing),
+    ])
+
+
+def shipper_ontime_report():
+    def run(v):
+        start, end = date_range(v)
+        _, rows = db.query(
+            "SELECT COUNT(*), COALESCE(SUM(s.delivery_outcome = 'ON_TIME'), 0), "
+            "COALESCE(SUM(s.delivery_outcome = 'LATE'), 0) FROM shipment s "
+            "JOIN scan_event e ON e.shipment_id = s.shipment_id AND e.status = 'DELIVERED' "
+            "WHERE s.shipper_id = %s AND DATE(e.scan_timestamp) BETWEEN %s AND %s",
+            (me["id"], start, end))
+        delivered, on_time, late = rows[0]
+        if not delivered:
+            return [], "No delivered shipments in this date range."
+        pct = lambda n: f"{round(100 * float(n) / delivered, 1)}%"
+        return ([("On time", on_time, pct(on_time)), ("Late", late, pct(late))],
+                f"Shipments delivered {start} to {end}: {delivered}")
+    report_page("On-Time vs Late Summary", DATE_SPECS, run,
+                ("outcome", "count", "pct"), ("Outcome", "Shipments", "Percent"), (200, 130, 130),
+                shipper_reports_menu, shipper_landing)
+
+
+IN_TRANSIT_COLS = (("id", "origin", "dest", "weight", "status", "promised", "days"),
+                   ("Shipment", "Origin", "Destination", "Weight kg", "Status", "Promised", "Days to Promise"),
+                   (80, 80, 100, 90, 150, 110, 120))
+IN_TRANSIT_SQL = ("SELECT shipment_id, origin_hub_id, destination_hub_id, weight_kg, "
+                  "COALESCE(current_status, 'NO SCANS YET'), promised_delivery_date, "
+                  "DATEDIFF(promised_delivery_date, CURDATE()) FROM shipment "
+                  "WHERE shipper_id = %s AND (current_status IS NULL OR current_status <> 'DELIVERED') ")
+
+
+def shipper_intransit_report():
+    def run(v):
+        _, rows = db.query(IN_TRANSIT_SQL + "ORDER BY shipment_id", (me["id"],))
+        return rows, f"{len(rows)} shipment(s) have not reached Delivered status."
+    report_page("In-Transit Shipments", [], run, *IN_TRANSIT_COLS, shipper_reports_menu, shipper_landing)
+
+
+def shipper_near_promise_report():
+    def run(v):
+        _, rows = db.query(IN_TRANSIT_SQL + "AND promised_delivery_date <= DATE_ADD(CURDATE(), INTERVAL %s DAY) "
+                           "ORDER BY promised_delivery_date, shipment_id", (me["id"], v["n"]))
+        return rows, f"{len(rows)} in-transit shipment(s) overdue or due within {v['n']} day(s)."
+    report_page("Shipments Near Promise Date", [("n", "N Days", "n", "7")], run, *IN_TRANSIT_COLS,
+                shipper_reports_menu, shipper_landing)
+
+
+# =========================================================
+# CARRIER
+# =========================================================
+
+def carrier_landing():
+    menu_page(f"Welcome, {me['name']}", "Carrier: Landing", [
+        ("Manage Vehicles", carrier_vehicles_menu),
+        ("Manage Departures", carrier_departures_menu),
+        ("Post Scan Event", carrier_post_scan),
+        ("Reports", carrier_reports_menu),
+        ("Logout", show_home),
+    ])
+
+
+def type_label(vtype):
+    return next(label for label, value in VEHICLE_TYPES.items() if value == vtype)
+
+
+def check_type_values(vtype, v):
+    if vtype == "REFRIGERATED_VAN" and v["min_temperature_c"] > v["max_temperature_c"]:
+        raise ValueError("Minimum Temperature cannot be higher than Maximum Temperature.")
+
+
+MY_VEHICLES_SQL = (
+    "SELECT v.vehicle_id, v.vehicle_type, v.home_hub_id, CASE v.vehicle_type "
+    "WHEN 'BOX_TRUCK' THEN CONCAT('Volume ', b.cargo_volume_m3, ' m3 | Rating ', b.gross_weight_rating_kg, ' kg') "
+    "WHEN 'REFRIGERATED_VAN' THEN CONCAT(r.min_temperature_c, ' to ', r.max_temperature_c, ' C | Payload ', "
+    "r.payload_limit_kg, ' kg') "
+    "WHEN 'RAIL_CAR' THEN CONCAT(rc.axle_count, ' axles | Gauge ', rc.track_gauge_mm, ' mm') END "
+    "FROM vehicle v LEFT JOIN box_truck b ON b.vehicle_id = v.vehicle_id "
+    "LEFT JOIN refrigerated_van r ON r.vehicle_id = v.vehicle_id "
+    "LEFT JOIN rail_car rc ON rc.vehicle_id = v.vehicle_id "
+    "WHERE v.carrier_id = %s ORDER BY v.vehicle_id")
+MY_VEHICLES_COLS = (("id", "type", "hub", "details"), ("Vehicle ID", "Type", "Home Hub", "Details"),
+                    (90, 160, 90, 420))
+
+
+def carrier_vehicles_menu():
+    menu_page("Manage Vehicles", "Carrier: Manage Vehicles", [
+        ("Add New Vehicle", carrier_add_vehicle),
+        ("Update Vehicle", carrier_update_vehicle),
+        ("View Vehicles", carrier_view_vehicles),
+        ("GoBack", carrier_landing),
+        ("LandingPage", carrier_landing),
+    ])
+
+
+def carrier_view_vehicles():
+    def run(v):
+        _, rows = db.query(MY_VEHICLES_SQL, (me["id"],))
+        return rows, f"{len(rows)} vehicle(s)"
+    report_page("My Vehicles", [], run, *MY_VEHICLES_COLS, carrier_vehicles_menu, carrier_landing)
+
+
+def carrier_add_vehicle():
+    clear_root()
+    create_title("Add New Vehicle", "Common details")
+    w = build_form([("vid", "Vehicle ID (blank = assign automatically)", "id_opt"),
+                    ("hub", "Home Hub ID", "hub"),
+                    ("vtype", "Vehicle Type", "choice", "", list(VEHICLE_TYPES))])
+    note("Hubs: " + ", ".join(get_hubs()))
+
+    def cont():
         try:
-            db.call_proc(
-                "book_shipment",
-                (sid, departure_id)
-            )
-
-            messagebox.showinfo(
-                "Booked",
-                (
-                    f"Shipment {sid} was booked "
-                    f"onto departure {departure_id}."
-                )
-            )
-
-            show_shipper_shipments(
-                account_id,
-                display_name
-            )
-
+            v = read_form(w)
+            if v["vid"] is not None and db.query("SELECT 1 FROM vehicle WHERE vehicle_id = %s", (v["vid"],))[1]:
+                raise ValueError(f"Vehicle ID {v['vid']} already exists.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
         except Exception as e:
-            messagebox.showerror(
-                "Booking Failed",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Book Selected Departure",
-        command=book,
-        width=28
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_shipper_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack(pady=10)
-
-
-# =========================================================
-# SHIPPER - TRACK
-# =========================================================
-
-def show_track_shipment(account_id, display_name):
-    clear_root()
-
-    create_title("Track Shipment")
-
-    _, rows = db.query(
-        """
-        SELECT shipment_id
-        FROM shipment
-        WHERE shipper_id = %s
-        ORDER BY shipment_id
-        """,
-        (account_id,)
-    )
-
-    ids = [
-        str(row[0])
-        for row in rows
-    ]
-
-    shipment_box = ttk.Combobox(
-        root,
-        values=ids,
-        state="readonly",
-        width=25
-    )
-    shipment_box.pack(pady=10)
-
-    info = ttk.Label(
-        root,
-        text="",
-        justify="left"
-    )
-    info.pack(pady=10)
-
-    frame = ttk.Frame(root)
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=20,
-        pady=10
-    )
-
-    tree = create_tree(
-        frame,
-        ("seq", "time", "hub", "status"),
-        ("Seq", "Timestamp", "Hub", "Status"),
-        (50, 160, 80, 140)
-    )
-
-    def track():
-        sid = shipment_box.get()
-
-        if not sid:
-            messagebox.showwarning(
-                "Select Shipment",
-                "Choose a shipment."
-            )
+            messagebox.showerror("Database Error", err_text(e))
             return
+        carrier_add_vehicle_details(v["vid"], v["hub"], VEHICLE_TYPES[v["vtype"]])
 
-        _, shipment = db.query(
-            """
-            SELECT
-                origin_hub_id,
-                destination_hub_id,
-                weight_kg,
-                promised_delivery_date,
-                COALESCE(
-                    current_status,
-                    'NO SCANS'
-                ),
-                COALESCE(
-                    delivery_outcome,
-                    '-'
-                )
-            FROM shipment
-            WHERE shipment_id = %s
-              AND shipper_id = %s
-            """,
-            (sid, account_id)
-        )
-
-        if not shipment:
-            return
-
-        row = shipment[0]
-
-        info.config(
-            text=(
-                f"Route: {row[0]} → {row[1]}\n"
-                f"Weight: {row[2]} kg\n"
-                f"Promised: {row[3]}\n"
-                f"Current Status: {row[4]}\n"
-                f"Outcome: {row[5]}"
-            )
-        )
-
-        for item in tree.get_children():
-            tree.delete(item)
-
-        _, scans = db.query(
-            """
-            SELECT
-                scan_sequence_no,
-                scan_timestamp,
-                hub_id,
-                status
-            FROM scan_event
-            WHERE shipment_id = %s
-            ORDER BY scan_sequence_no
-            """,
-            (sid,)
-        )
-
-        for scan in scans:
-            tree.insert(
-                "",
-                "end",
-                values=scan
-            )
-
-    ttk.Button(
-        root,
-        text="Track",
-        command=track,
-        width=25
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_shipper_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack(pady=10)
+    action_bar([("Continue", cont), ("GoBack", carrier_vehicles_menu), ("LandingPage", carrier_landing)])
 
 
-# =========================================================
-# SHIPPER - REPORTS
-# =========================================================
-
-def show_shipper_reports(account_id, display_name):
+def carrier_add_vehicle_details(vid, hub, vtype):
+    table_name, attrs = TYPE_DETAILS[vtype]
     clear_root()
+    create_title(f"Add {type_label(vtype)} Details", f"Home hub {hub}")
+    w = build_form([(c, label, kind) for c, label, kind in attrs])
 
-    create_title("Shipper Reports")
-
-    _, summary = db.query(
-        """
-        SELECT
-            COUNT(*) AS delivered,
-            COALESCE(
-                SUM(delivery_outcome = 'ON_TIME'),
-                0
-            ),
-            COALESCE(
-                SUM(delivery_outcome = 'LATE'),
-                0
-            ),
-            ROUND(
-                100 *
-                SUM(delivery_outcome = 'ON_TIME') /
-                NULLIF(COUNT(*), 0),
-                1
-            )
-        FROM shipment
-        WHERE shipper_id = %s
-          AND delivery_outcome IS NOT NULL
-        """,
-        (account_id,)
-    )
-
-    delivered, on_time, late, pct = summary[0]
-
-    ttk.Label(
-        root,
-        text=(
-            f"Delivered: {delivered}     "
-            f"On Time: {on_time}     "
-            f"Late: {late}     "
-            f"On-Time Rate: {pct if pct is not None else '-'}%"
-        ),
-        font=("Arial", 12, "bold")
-    ).pack(pady=15)
-
-    ttk.Label(
-        root,
-        text="Shipments Currently In Transit",
-        font=("Arial", 12)
-    ).pack(pady=5)
-
-    _, rows = db.query(
-        """
-        SELECT
-            shipment_id,
-            origin_hub_id,
-            destination_hub_id,
-            current_status,
-            promised_delivery_date
-        FROM shipment
-        WHERE shipper_id = %s
-          AND current_status IS NOT NULL
-          AND current_status <> 'DELIVERED'
-        ORDER BY shipment_id
-        """,
-        (account_id,)
-    )
-
-    frame = ttk.Frame(root)
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=20,
-        pady=10
-    )
-
-    tree = create_tree(
-        frame,
-        (
-            "id",
-            "origin",
-            "dest",
-            "status",
-            "promised"
-        ),
-        (
-            "ID",
-            "Origin",
-            "Destination",
-            "Status",
-            "Promised"
-        ),
-        (70, 80, 100, 150, 110)
-    )
-
-    for row in rows:
-        tree.insert(
-            "",
-            "end",
-            values=row
-        )
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_shipper_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack(pady=15)
-
-
-# =========================================================
-# CARRIER DASHBOARD
-# =========================================================
-
-def show_carrier_dashboard(account_id, display_name):
-    clear_root()
-
-    create_title(
-        f"Welcome, {display_name}",
-        "Carrier Dashboard"
-    )
-
-    options = [
-        (
-            "List My Vehicles",
-            lambda: show_carrier_vehicles(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Create Vehicle",
-            lambda: show_create_vehicle(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Update Vehicle",
-            lambda: show_update_vehicle(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "List Departures",
-            lambda: show_carrier_departures(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Create Departure",
-            lambda: show_create_departure(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Update Departure",
-            lambda: show_update_departure(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Post Scan Event",
-            lambda: show_post_scan(
-                account_id,
-                display_name
-            )
-        ),
-        (
-            "Reports",
-            lambda: show_carrier_reports(
-                account_id,
-                display_name
-            )
-        )
-    ]
-
-    for label, command in options:
-        ttk.Button(
-            root,
-            text=label,
-            command=command,
-            width=30
-        ).pack(pady=5)
-
-    ttk.Button(
-        root,
-        text="Logout",
-        command=show_home,
-        width=30
-    ).pack(pady=18)
-
-
-# =========================================================
-# CARRIER - LIST VEHICLES
-# =========================================================
-
-def show_carrier_vehicles(account_id, display_name):
-    _, rows = db.query(
-        """
-        SELECT
-            v.vehicle_id,
-            v.vehicle_type,
-            v.home_hub_id,
-            CASE
-                WHEN v.vehicle_type = 'BOX_TRUCK'
-                    THEN CONCAT(
-                        'Volume ',
-                        b.cargo_volume_m3,
-                        ' m3 | Rating ',
-                        b.gross_weight_rating_kg,
-                        ' kg'
-                    )
-                WHEN v.vehicle_type = 'REFRIGERATED_VAN'
-                    THEN CONCAT(
-                        r.min_temperature_c,
-                        ' to ',
-                        r.max_temperature_c,
-                        ' C | Payload ',
-                        r.payload_limit_kg,
-                        ' kg'
-                    )
-                WHEN v.vehicle_type = 'RAIL_CAR'
-                    THEN CONCAT(
-                        rc.axle_count,
-                        ' axles | Gauge ',
-                        rc.track_gauge_mm,
-                        ' mm'
-                    )
-            END AS details
-        FROM vehicle v
-        LEFT JOIN box_truck b
-            ON b.vehicle_id = v.vehicle_id
-        LEFT JOIN refrigerated_van r
-            ON r.vehicle_id = v.vehicle_id
-        LEFT JOIN rail_car rc
-            ON rc.vehicle_id = v.vehicle_id
-        WHERE v.carrier_id = %s
-        ORDER BY v.vehicle_id
-        """,
-        (account_id,)
-    )
-
-    show_rows(
-        "My Vehicles",
-        (
-            "id",
-            "type",
-            "hub",
-            "details"
-        ),
-        (
-            "Vehicle ID",
-            "Type",
-            "Home Hub",
-            "Details"
-        ),
-        rows,
-        (100, 170, 100, 350),
-        lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        )
-    )
-
-
-# =========================================================
-# CARRIER - CREATE VEHICLE
-# =========================================================
-
-def show_create_vehicle(account_id, display_name):
-    clear_root()
-
-    create_title("Create Vehicle")
-
-    hubs = get_hubs()
-
-    main_form = ttk.Frame(root)
-    main_form.pack(pady=10)
-
-    ttk.Label(
-        main_form,
-        text="Vehicle Type"
-    ).grid(
-        row=0,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    type_box = ttk.Combobox(
-        main_form,
-        values=[
-            "BOX_TRUCK",
-            "REFRIGERATED_VAN",
-            "RAIL_CAR"
-        ],
-        state="readonly",
-        width=25
-    )
-    type_box.grid(
-        row=0,
-        column=1,
-        padx=10,
-        pady=10
-    )
-
-    ttk.Label(
-        main_form,
-        text="Home Hub"
-    ).grid(
-        row=1,
-        column=0,
-        padx=10,
-        pady=10
-    )
-
-    hub_box = ttk.Combobox(
-        main_form,
-        values=hubs,
-        state="readonly",
-        width=25
-    )
-    hub_box.grid(
-        row=1,
-        column=1,
-        padx=10,
-        pady=10
-    )
-
-    subtype_frame = ttk.LabelFrame(
-        root,
-        text="Vehicle Details"
-    )
-    subtype_frame.pack(
-        padx=20,
-        pady=15
-    )
-
-    subtype_entries = {}
-
-    def rebuild_fields(event=None):
-        for widget in subtype_frame.winfo_children():
-            widget.destroy()
-
-        subtype_entries.clear()
-
-        vtype = type_box.get()
-
-        if vtype == "BOX_TRUCK":
-            fields = [
-                (
-                    "cargo_volume_m3",
-                    "Cargo Volume (m³)"
-                ),
-                (
-                    "gross_weight_rating_kg",
-                    "Gross Weight Rating (kg)"
-                )
-            ]
-
-        elif vtype == "REFRIGERATED_VAN":
-            fields = [
-                (
-                    "min_temperature_c",
-                    "Minimum Temperature (°C)"
-                ),
-                (
-                    "max_temperature_c",
-                    "Maximum Temperature (°C)"
-                ),
-                (
-                    "payload_limit_kg",
-                    "Payload Limit (kg)"
-                )
-            ]
-
-        elif vtype == "RAIL_CAR":
-            fields = [
-                (
-                    "axle_count",
-                    "Axle Count"
-                ),
-                (
-                    "track_gauge_mm",
-                    "Track Gauge (mm)"
-                )
-            ]
-
-        else:
-            return
-
-        for row_num, (column, label) in enumerate(fields):
-            ttk.Label(
-                subtype_frame,
-                text=label
-            ).grid(
-                row=row_num,
-                column=0,
-                padx=10,
-                pady=8,
-                sticky="e"
-            )
-
-            entry = ttk.Entry(
-                subtype_frame,
-                width=25
-            )
-            entry.grid(
-                row=row_num,
-                column=1,
-                padx=10,
-                pady=8
-            )
-
-            subtype_entries[column] = entry
-
-    type_box.bind(
-        "<<ComboboxSelected>>",
-        rebuild_fields
-    )
-
-    def create():
-        vtype = type_box.get()
-        hub = hub_box.get()
-
-        if not vtype or not hub:
-            messagebox.showwarning(
-                "Missing Information",
-                "Select a vehicle type and home hub."
-            )
-            return
-
+    def save():
         try:
-            values = {}
+            v = read_form(w)
+            check_type_values(vtype, v)
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
 
-            for column, entry in subtype_entries.items():
-                text = entry.get().strip()
-
-                if not text:
-                    raise ValueError(
-                        "Fill out every vehicle detail."
-                    )
-
-                values[column] = float(text)
-
-            if (
-                vtype == "REFRIGERATED_VAN"
-                and values["min_temperature_c"]
-                > values["max_temperature_c"]
-            ):
-                raise ValueError(
-                    "Minimum temperature cannot exceed maximum temperature."
-                )
-
-            if vtype == "RAIL_CAR":
-                axle_count = values["axle_count"]
-
-                if not axle_count.is_integer():
-                    raise ValueError(
-                        "Axle count must be a whole number."
-                    )
-
-                values["axle_count"] = int(axle_count)
-
-            for value in values.values():
-                if (
-                    value <= 0
-                    and vtype != "REFRIGERATED_VAN"
-                ):
-                    raise ValueError(
-                        "Vehicle values must be greater than 0."
-                    )
-
-            with db.transaction() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO vehicle (
-                        carrier_id,
-                        home_hub_id,
-                        vehicle_type
-                    )
-                    VALUES (%s, %s, %s)
-                    """,
-                    (
-                        account_id,
-                        hub,
-                        vtype
-                    )
-                )
-
-                vehicle_id = cur.lastrowid
-
-                if vtype == "BOX_TRUCK":
-                    cur.execute(
-                        """
-                        INSERT INTO box_truck (
-                            vehicle_id,
-                            cargo_volume_m3,
-                            gross_weight_rating_kg
-                        )
-                        VALUES (%s, %s, %s)
-                        """,
-                        (
-                            vehicle_id,
-                            values["cargo_volume_m3"],
-                            values[
-                                "gross_weight_rating_kg"
-                            ]
-                        )
-                    )
-
-                elif vtype == "REFRIGERATED_VAN":
-                    cur.execute(
-                        """
-                        INSERT INTO refrigerated_van (
-                            vehicle_id,
-                            min_temperature_c,
-                            max_temperature_c,
-                            payload_limit_kg
-                        )
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (
-                            vehicle_id,
-                            values[
-                                "min_temperature_c"
-                            ],
-                            values[
-                                "max_temperature_c"
-                            ],
-                            values[
-                                "payload_limit_kg"
-                            ]
-                        )
-                    )
-
+        def action():
+            cols = [c for c, _, _ in attrs]
+            with db.transaction() as cur:       # vehicle row + subtype row, all or nothing
+                if vid is None:
+                    cur.execute("INSERT INTO vehicle (carrier_id, home_hub_id, vehicle_type) VALUES (%s, %s, %s)",
+                                (me["id"], hub, vtype))
+                    new_id = cur.lastrowid
                 else:
-                    cur.execute(
-                        """
-                        INSERT INTO rail_car (
-                            vehicle_id,
-                            axle_count,
-                            track_gauge_mm
-                        )
-                        VALUES (%s, %s, %s)
-                        """,
-                        (
-                            vehicle_id,
-                            values["axle_count"],
-                            values["track_gauge_mm"]
-                        )
-                    )
+                    cur.execute("INSERT INTO vehicle (vehicle_id, carrier_id, home_hub_id, vehicle_type) "
+                                "VALUES (%s, %s, %s, %s)", (vid, me["id"], hub, vtype))
+                    new_id = vid
+                cur.execute(f"INSERT INTO {table_name} (vehicle_id, {', '.join(cols)}) "
+                            f"VALUES (%s{', %s' * len(cols)})", [new_id] + [v[c] for c in cols])
+            return f"Vehicle {new_id} ({type_label(vtype)}) was added."
+        run_action(action, "Vehicle Added", "Add Vehicle Failed", carrier_vehicles_menu)
 
-            messagebox.showinfo(
-                "Vehicle Created",
-                f"Vehicle {vehicle_id} was created."
-            )
-
-            show_carrier_vehicles(
-                account_id,
-                display_name
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Create Vehicle Failed",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Create Vehicle",
-        command=create,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack()
+    action_bar([("Save", save), ("Cancel", carrier_add_vehicle), ("LandingPage", carrier_landing)])
 
 
-# =========================================================
-# CARRIER - UPDATE VEHICLE
-# =========================================================
-
-def show_update_vehicle(account_id, display_name):
+def carrier_update_vehicle():
     clear_root()
-
     create_title("Update Vehicle")
+    w = build_form([("vid", "Vehicle ID", "id")])
+    table(*MY_VEHICLES_COLS, rows=db.query(MY_VEHICLES_SQL, (me["id"],))[1], height=8)
 
-    _, rows = db.query(
-        """
-        SELECT
-            vehicle_id,
-            vehicle_type
-        FROM vehicle
-        WHERE carrier_id = %s
-        ORDER BY vehicle_id
-        """,
-        (account_id,)
-    )
-
-    if not rows:
-        messagebox.showinfo(
-            "No Vehicles",
-            "This carrier has no vehicles."
-        )
-        show_carrier_dashboard(
-            account_id,
-            display_name
-        )
-        return
-
-    vehicle_map = {
-        str(vehicle_id): vehicle_type
-        for vehicle_id, vehicle_type in rows
-    }
-
-    hubs = get_hubs()
-
-    form = ttk.Frame(root)
-    form.pack(pady=10)
-
-    ttk.Label(
-        form,
-        text="Vehicle ID"
-    ).grid(
-        row=0,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    vehicle_box = ttk.Combobox(
-        form,
-        values=list(vehicle_map.keys()),
-        state="readonly",
-        width=25
-    )
-    vehicle_box.grid(
-        row=0,
-        column=1,
-        padx=10,
-        pady=8
-    )
-
-    ttk.Label(
-        form,
-        text="Home Hub"
-    ).grid(
-        row=1,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    hub_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly",
-        width=25
-    )
-    hub_box.grid(
-        row=1,
-        column=1,
-        padx=10,
-        pady=8
-    )
-
-    details_frame = ttk.LabelFrame(
-        root,
-        text="Vehicle Details"
-    )
-    details_frame.pack(
-        padx=20,
-        pady=15
-    )
-
-    detail_entries = {}
-
-    def load_vehicle(event=None):
-        for widget in details_frame.winfo_children():
-            widget.destroy()
-
-        detail_entries.clear()
-
-        vehicle_id = vehicle_box.get()
-
-        if not vehicle_id:
-            return
-
-        vtype = vehicle_map[vehicle_id]
-
-        _, base = db.query(
-            """
-            SELECT home_hub_id
-            FROM vehicle
-            WHERE vehicle_id = %s
-              AND carrier_id = %s
-            """,
-            (
-                vehicle_id,
-                account_id
-            )
-        )
-
-        hub_box.set(base[0][0])
-
-        if vtype == "BOX_TRUCK":
-            _, data = db.query(
-                """
-                SELECT
-                    cargo_volume_m3,
-                    gross_weight_rating_kg
-                FROM box_truck
-                WHERE vehicle_id = %s
-                """,
-                (vehicle_id,)
-            )
-
-            fields = [
-                (
-                    "cargo_volume_m3",
-                    "Cargo Volume (m³)",
-                    data[0][0]
-                ),
-                (
-                    "gross_weight_rating_kg",
-                    "Gross Weight Rating (kg)",
-                    data[0][1]
-                )
-            ]
-
-        elif vtype == "REFRIGERATED_VAN":
-            _, data = db.query(
-                """
-                SELECT
-                    min_temperature_c,
-                    max_temperature_c,
-                    payload_limit_kg
-                FROM refrigerated_van
-                WHERE vehicle_id = %s
-                """,
-                (vehicle_id,)
-            )
-
-            fields = [
-                (
-                    "min_temperature_c",
-                    "Minimum Temperature (°C)",
-                    data[0][0]
-                ),
-                (
-                    "max_temperature_c",
-                    "Maximum Temperature (°C)",
-                    data[0][1]
-                ),
-                (
-                    "payload_limit_kg",
-                    "Payload Limit (kg)",
-                    data[0][2]
-                )
-            ]
-
-        else:
-            _, data = db.query(
-                """
-                SELECT
-                    axle_count,
-                    track_gauge_mm
-                FROM rail_car
-                WHERE vehicle_id = %s
-                """,
-                (vehicle_id,)
-            )
-
-            fields = [
-                (
-                    "axle_count",
-                    "Axle Count",
-                    data[0][0]
-                ),
-                (
-                    "track_gauge_mm",
-                    "Track Gauge (mm)",
-                    data[0][1]
-                )
-            ]
-
-        ttk.Label(
-            details_frame,
-            text=f"Type: {vtype}",
-            font=("Arial", 10, "bold")
-        ).grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            pady=8
-        )
-
-        for row_num, (
-            column,
-            label,
-            value
-        ) in enumerate(
-            fields,
-            start=1
-        ):
-            ttk.Label(
-                details_frame,
-                text=label
-            ).grid(
-                row=row_num,
-                column=0,
-                padx=10,
-                pady=8
-            )
-
-            entry = ttk.Entry(
-                details_frame,
-                width=25
-            )
-            entry.grid(
-                row=row_num,
-                column=1,
-                padx=10,
-                pady=8
-            )
-
-            entry.insert(
-                0,
-                value
-            )
-
-            detail_entries[column] = entry
-
-    vehicle_box.bind(
-        "<<ComboboxSelected>>",
-        load_vehicle
-    )
-
-    def update():
-        vehicle_id = vehicle_box.get()
-
-        if not vehicle_id:
-            messagebox.showwarning(
-                "Select Vehicle",
-                "Choose a vehicle."
-            )
-            return
-
+    def go(kind):
         try:
-            vtype = vehicle_map[vehicle_id]
-
-            values = {}
-
-            for column, entry in detail_entries.items():
-                values[column] = float(
-                    entry.get().strip()
-                )
-
-            if (
-                vtype == "REFRIGERATED_VAN"
-                and values["min_temperature_c"]
-                > values["max_temperature_c"]
-            ):
-                raise ValueError(
-                    "Minimum temperature cannot exceed maximum temperature."
-                )
-
-            db.execute(
-                """
-                UPDATE vehicle
-                SET home_hub_id = %s
-                WHERE vehicle_id = %s
-                  AND carrier_id = %s
-                """,
-                (
-                    hub_box.get(),
-                    vehicle_id,
-                    account_id
-                )
-            )
-
-            if vtype == "BOX_TRUCK":
-                db.execute(
-                    """
-                    UPDATE box_truck
-                    SET cargo_volume_m3 = %s,
-                        gross_weight_rating_kg = %s
-                    WHERE vehicle_id = %s
-                    """,
-                    (
-                        values["cargo_volume_m3"],
-                        values[
-                            "gross_weight_rating_kg"
-                        ],
-                        vehicle_id
-                    )
-                )
-
-            elif vtype == "REFRIGERATED_VAN":
-                db.execute(
-                    """
-                    UPDATE refrigerated_van
-                    SET min_temperature_c = %s,
-                        max_temperature_c = %s,
-                        payload_limit_kg = %s
-                    WHERE vehicle_id = %s
-                    """,
-                    (
-                        values[
-                            "min_temperature_c"
-                        ],
-                        values[
-                            "max_temperature_c"
-                        ],
-                        values[
-                            "payload_limit_kg"
-                        ],
-                        vehicle_id
-                    )
-                )
-
-            else:
-                axle = values["axle_count"]
-
-                if not axle.is_integer():
-                    raise ValueError(
-                        "Axle count must be a whole number."
-                    )
-
-                db.execute(
-                    """
-                    UPDATE rail_car
-                    SET axle_count = %s,
-                        track_gauge_mm = %s
-                    WHERE vehicle_id = %s
-                    """,
-                    (
-                        int(axle),
-                        values["track_gauge_mm"],
-                        vehicle_id
-                    )
-                )
-
-            messagebox.showinfo(
-                "Updated",
-                f"Vehicle {vehicle_id} was updated."
-            )
-
-            show_carrier_vehicles(
-                account_id,
-                display_name
-            )
-
+            v = read_form(w)
+            _, rows = db.query("SELECT vehicle_type, home_hub_id FROM vehicle "
+                               "WHERE vehicle_id = %s AND carrier_id = %s", (v["vid"], me["id"]))
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
         except Exception as e:
-            messagebox.showerror(
-                "Update Vehicle Failed",
-                str(e)
-            )
+            messagebox.showerror("Database Error", err_text(e))
+            return
+        if not rows:
+            messagebox.showerror("Not Allowed", "That vehicle does not exist or is not owned by your carrier account.")
+            return
+        vtype, hub = rows[0]
+        if kind == "common":
+            carrier_update_common(v["vid"], hub)
+        else:
+            carrier_update_type(v["vid"], vtype)
 
-    ttk.Button(
-        root,
-        text="Update Vehicle",
-        command=update,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack()
+    action_bar([("Update Common Details", lambda: go("common")), ("Update Type Details", lambda: go("type")),
+                ("GoBack", carrier_vehicles_menu), ("LandingPage", carrier_landing)])
 
 
-# =========================================================
-# CARRIER - LIST DEPARTURES
-# =========================================================
+def carrier_update_common(vid, hub):
+    clear_root()
+    create_title(f"Update Vehicle {vid}", "Common details")
+    w = build_form([("hub", "Home Hub ID", "hub", hub)])
+    note("Hubs: " + ", ".join(get_hubs()))
 
-def show_carrier_departures(account_id, display_name):
-    _, rows = db.query(
-        """
-        SELECT
-            l.departure_id,
-            l.vehicle_id,
-            l.origin_hub_id,
-            l.destination_hub_id,
-            l.departure_datetime,
-            l.booked_weight_kg,
-            l.maximum_weight_kg,
-            l.utilization_pct
-        FROM v_departure_load l
-        JOIN vehicle v
-            ON v.vehicle_id = l.vehicle_id
-        WHERE v.carrier_id = %s
-        ORDER BY l.departure_id
-        """,
-        (account_id,)
-    )
+    def save():
+        try:
+            v = read_form(w)
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
 
-    show_rows(
-        "My Departures",
-        (
-            "id",
-            "vehicle",
-            "origin",
-            "dest",
-            "time",
-            "booked",
-            "max",
-            "util"
-        ),
-        (
-            "ID",
-            "Vehicle",
-            "Origin",
-            "Destination",
-            "Date/Time",
-            "Booked kg",
-            "Max kg",
-            "Utilization %"
-        ),
-        rows,
-        (
-            60,
-            70,
-            70,
-            90,
-            150,
-            80,
-            80,
-            100
-        ),
-        lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        )
-    )
+        def action():
+            db.execute("UPDATE vehicle SET home_hub_id = %s WHERE vehicle_id = %s AND carrier_id = %s",
+                       (v["hub"], vid, me["id"]))
+            return f"Vehicle {vid} now has home hub {v['hub']}."
+        run_action(action, "Vehicle Updated", "Update Vehicle Failed", carrier_vehicles_menu)
+
+    action_bar([("Save", save), ("Cancel", carrier_update_vehicle), ("LandingPage", carrier_landing)])
 
 
-# =========================================================
-# CARRIER - VEHICLE CAPACITY HELPER
-# =========================================================
+def carrier_update_type(vid, vtype):
+    table_name, attrs = TYPE_DETAILS[vtype]
+    cols = [c for c, _, _ in attrs]
+    _, rows = db.query(f"SELECT {', '.join(cols)} FROM {table_name} WHERE vehicle_id = %s", (vid,))
+    clear_root()
+    create_title(f"Update Vehicle {vid}", f"{type_label(vtype)} details")
+    w = build_form([(c, label, kind, rows[0][i]) for i, (c, label, kind) in enumerate(attrs)])
+
+    def save():
+        try:
+            v = read_form(w)
+            check_type_values(vtype, v)
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
+
+        def action():
+            sets = ", ".join(f"{c} = %s" for c in cols)
+            db.execute(f"UPDATE {table_name} SET {sets} WHERE vehicle_id = %s "
+                       f"AND EXISTS (SELECT 1 FROM vehicle WHERE vehicle_id = %s AND carrier_id = %s)",
+                       [v[c] for c in cols] + [vid, vid, me["id"]])
+            return f"Vehicle {vid} details were updated."
+        run_action(action, "Vehicle Updated", "Update Vehicle Failed", carrier_vehicles_menu)
+
+    action_bar([("Save", save), ("Cancel", carrier_update_vehicle), ("LandingPage", carrier_landing)])
+
+
+# ---------- departures ----------
+
+def carrier_departures_menu():
+    menu_page("Manage Departures", "Carrier: Manage Departures", [
+        ("Schedule Departure", carrier_schedule_departure),
+        ("Update Departure", carrier_update_departure),
+        ("View Departures", carrier_view_departures),
+        ("GoBack", carrier_landing),
+        ("LandingPage", carrier_landing),
+    ])
+
+
+MY_DEPARTURES_SQL = (
+    "SELECT l.departure_id, l.vehicle_id, l.origin_hub_id, l.destination_hub_id, l.departure_datetime, "
+    "l.maximum_weight_kg, l.booked_weight_kg, l.remaining_kg FROM v_departure_load l "
+    "JOIN vehicle v ON v.vehicle_id = l.vehicle_id WHERE v.carrier_id = %s ORDER BY l.departure_id")
+MY_DEPARTURES_COLS = (("id", "vehicle", "origin", "dest", "time", "cap", "booked", "remaining"),
+                      ("Departure", "Vehicle", "Origin", "Destination", "Date/Time", "Capacity kg",
+                       "Booked kg", "Remaining kg"), (80, 70, 70, 90, 150, 100, 90, 100))
+
 
 def vehicle_weight_limit(vehicle_id):
+    """Application-level rule: a departure's capacity cannot exceed what the vehicle can carry."""
     _, rows = db.query(
-        """
-        SELECT
-            COALESCE(
-                b.gross_weight_rating_kg,
-                r.payload_limit_kg
-            )
-        FROM vehicle v
-        LEFT JOIN box_truck b
-            ON b.vehicle_id = v.vehicle_id
-        LEFT JOIN refrigerated_van r
-            ON r.vehicle_id = v.vehicle_id
-        WHERE v.vehicle_id = %s
-        """,
-        (vehicle_id,)
-    )
-
-    if rows and rows[0][0] is not None:
-        return float(rows[0][0])
-
-    return None
+        "SELECT COALESCE(b.gross_weight_rating_kg, r.payload_limit_kg) FROM vehicle v "
+        "LEFT JOIN box_truck b ON b.vehicle_id = v.vehicle_id "
+        "LEFT JOIN refrigerated_van r ON r.vehicle_id = v.vehicle_id WHERE v.vehicle_id = %s", (vehicle_id,))
+    return rows[0][0] if rows and rows[0][0] is not None else None     # rail cars: no limit stored
 
 
-# =========================================================
-# CARRIER - CREATE DEPARTURE
-# =========================================================
+def owns_vehicle(vehicle_id):
+    return bool(db.query("SELECT 1 FROM vehicle WHERE vehicle_id = %s AND carrier_id = %s",
+                         (vehicle_id, me["id"]))[1])
 
-def show_create_departure(account_id, display_name):
+
+def carrier_view_departures():
+    def run(v):
+        _, rows = db.query(MY_DEPARTURES_SQL, (me["id"],))
+        return rows, f"{len(rows)} departure(s)"
+    report_page("My Departures", [], run, *MY_DEPARTURES_COLS, carrier_departures_menu, carrier_landing)
+
+
+def carrier_schedule_departure():
     clear_root()
+    create_title("Schedule Departure")
+    w = build_form([("vid", "Vehicle ID", "id"), ("origin", "Origin Hub ID", "hub"),
+                    ("dest", "Destination Hub ID", "hub"),
+                    ("when", "Departure Date/Time (YYYY-MM-DD HH:MM)", "datetime"),
+                    ("cap", "Capacity (max total weight, kg)", "dec")])
+    note("Hubs: " + ", ".join(get_hubs()))
+    table(*MY_VEHICLES_COLS, rows=db.query(MY_VEHICLES_SQL, (me["id"],))[1], height=5)
 
-    create_title("Create Departure")
-
-    _, vehicles = db.query(
-        """
-        SELECT vehicle_id
-        FROM vehicle
-        WHERE carrier_id = %s
-        ORDER BY vehicle_id
-        """,
-        (account_id,)
-    )
-
-    vehicle_ids = [
-        str(row[0])
-        for row in vehicles
-    ]
-
-    hubs = get_hubs()
-
-    form = ttk.Frame(root)
-    form.pack(pady=10)
-
-    fields = [
-        "Vehicle",
-        "Origin",
-        "Destination",
-        "Departure Time",
-        "Maximum Weight (kg)"
-    ]
-
-    for i, label in enumerate(fields):
-        ttk.Label(
-            form,
-            text=label
-        ).grid(
-            row=i,
-            column=0,
-            padx=10,
-            pady=8
-        )
-
-    vehicle_box = ttk.Combobox(
-        form,
-        values=vehicle_ids,
-        state="readonly"
-    )
-    vehicle_box.grid(row=0, column=1)
-
-    origin_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly"
-    )
-    origin_box.grid(row=1, column=1)
-
-    destination_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly"
-    )
-    destination_box.grid(row=2, column=1)
-
-    time_entry = ttk.Entry(form)
-    time_entry.grid(row=3, column=1)
-
-    weight_entry = ttk.Entry(form)
-    weight_entry.grid(row=4, column=1)
-
-    ttk.Label(
-        root,
-        text="Date/time format: YYYY-MM-DD HH:MM"
-    ).pack()
-
-    def create():
-        vehicle_id = vehicle_box.get()
-        origin = origin_box.get()
-        destination = destination_box.get()
-
-        if not all(
-            (
-                vehicle_id,
-                origin,
-                destination,
-                time_entry.get().strip(),
-                weight_entry.get().strip()
-            )
-        ):
-            messagebox.showwarning(
-                "Missing Information",
-                "Fill out every field."
-            )
+    def save():
+        try:
+            v = read_form(w)
+            if v["origin"] == v["dest"]:
+                raise ValueError("Origin and destination hubs must be different.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
             return
 
-        try:
-            if origin == destination:
-                raise ValueError(
-                    "Origin and destination must differ."
-                )
-
-            when = valid_datetime(
-                time_entry.get().strip()
-            )
-
-            maximum = float(
-                weight_entry.get().strip()
-            )
-
-            if maximum <= 0:
-                raise ValueError(
-                    "Maximum weight must be greater than 0."
-                )
-
-            limit = vehicle_weight_limit(
-                vehicle_id
-            )
-
-            if (
-                limit is not None
-                and maximum > limit
-            ):
-                raise ValueError(
-                    f"This vehicle can carry at most {limit} kg."
-                )
-
+        def action():
+            if not owns_vehicle(v["vid"]):
+                raise Rejected("That vehicle does not exist or is not owned by your carrier account.")
+            limit = vehicle_weight_limit(v["vid"])
+            if limit is not None and v["cap"] > limit:
+                raise Rejected(f"This vehicle can carry at most {limit} kg.")
             new_id = db.execute(
-                """
-                INSERT INTO departure (
-                    vehicle_id,
-                    origin_hub_id,
-                    destination_hub_id,
-                    departure_datetime,
-                    maximum_weight_kg
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    vehicle_id,
-                    origin,
-                    destination,
-                    when,
-                    maximum
-                )
-            )
+                "INSERT INTO departure (vehicle_id, origin_hub_id, destination_hub_id, departure_datetime, "
+                "maximum_weight_kg) VALUES (%s, %s, %s, %s, %s)",
+                (v["vid"], v["origin"], v["dest"], v["when"], v["cap"]))
+            return f"Departure {new_id} was scheduled. Remaining capacity: {v['cap']} kg."
+        run_action(action, "Departure Scheduled", "Schedule Departure Failed", carrier_departures_menu)
 
-            messagebox.showinfo(
-                "Created",
-                f"Departure {new_id} was created."
-            )
-
-            show_carrier_departures(
-                account_id,
-                display_name
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Create Departure Failed",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Create Departure",
-        command=create,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack()
+    action_bar([("Save", save), ("Cancel", carrier_departures_menu), ("LandingPage", carrier_landing)])
 
 
-# =========================================================
-# CARRIER - UPDATE DEPARTURE
-# =========================================================
-
-def show_update_departure(account_id, display_name):
+def carrier_update_departure():
     clear_root()
-
     create_title("Update Departure")
+    w = build_form([("did", "Departure ID", "id"), ("vid", "Vehicle ID", "id"),
+                    ("origin", "Origin Hub ID", "hub"), ("dest", "Destination Hub ID", "hub"),
+                    ("when", "Departure Date/Time (YYYY-MM-DD HH:MM)", "datetime"),
+                    ("cap", "Capacity (max total weight, kg)", "dec")])
+    note("Enter a Departure ID and press Tab to load its current values.")
+    table(*MY_DEPARTURES_COLS, rows=db.query(MY_DEPARTURES_SQL, (me["id"],))[1], height=6)
 
-    _, rows = db.query(
-        """
-        SELECT
-            l.departure_id,
-            l.vehicle_id,
-            l.departure_datetime,
-            l.maximum_weight_kg,
-            l.booked_weight_kg
-        FROM v_departure_load l
-        JOIN vehicle v
-            ON v.vehicle_id = l.vehicle_id
-        WHERE v.carrier_id = %s
-        ORDER BY l.departure_id
-        """,
-        (account_id,)
-    )
-
-    if not rows:
-        messagebox.showinfo(
-            "No Departures",
-            "This carrier has no departures."
-        )
-        show_carrier_dashboard(
-            account_id,
-            display_name
-        )
-        return
-
-    departure_map = {
-        str(row[0]): row
-        for row in rows
-    }
-
-    form = ttk.Frame(root)
-    form.pack(pady=15)
-
-    ttk.Label(
-        form,
-        text="Departure ID"
-    ).grid(
-        row=0,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    departure_box = ttk.Combobox(
-        form,
-        values=list(
-            departure_map.keys()
-        ),
-        state="readonly",
-        width=25
-    )
-    departure_box.grid(
-        row=0,
-        column=1,
-        padx=10,
-        pady=8
-    )
-
-    ttk.Label(
-        form,
-        text="Departure Time"
-    ).grid(
-        row=1,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    time_entry = ttk.Entry(
-        form,
-        width=28
-    )
-    time_entry.grid(
-        row=1,
-        column=1,
-        padx=10,
-        pady=8
-    )
-
-    ttk.Label(
-        form,
-        text="Maximum Weight (kg)"
-    ).grid(
-        row=2,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    weight_entry = ttk.Entry(
-        form,
-        width=28
-    )
-    weight_entry.grid(
-        row=2,
-        column=1,
-        padx=10,
-        pady=8
-    )
-
-    booked_label = ttk.Label(
-        root,
-        text=""
-    )
-    booked_label.pack(pady=5)
-
-    def load(event=None):
-        departure_id = departure_box.get()
-
-        if not departure_id:
-            return
-
-        row = departure_map[departure_id]
-
-        time_entry.delete(0, tk.END)
-        time_entry.insert(
-            0,
-            row[2]
-        )
-
-        weight_entry.delete(0, tk.END)
-        weight_entry.insert(
-            0,
-            row[3]
-        )
-
-        booked_label.config(
-            text=(
-                f"Currently booked weight: "
-                f"{row[4]} kg"
-            )
-        )
-
-    departure_box.bind(
-        "<<ComboboxSelected>>",
-        load
-    )
-
-    def update():
-        departure_id = departure_box.get()
-
-        if not departure_id:
-            messagebox.showwarning(
-                "Select Departure",
-                "Choose a departure."
-            )
-            return
-
+    def prefill(event=None):
         try:
-            row = departure_map[
-                departure_id
-            ]
-
-            vehicle_id = row[1]
-            booked_weight = float(row[4])
-
-            when = valid_datetime(
-                time_entry.get().strip()
-            )
-
-            maximum = float(
-                weight_entry.get().strip()
-            )
-
-            if maximum < booked_weight:
-                raise ValueError(
-                    (
-                        f"Cannot lower capacity below "
-                        f"{booked_weight} kg because that "
-                        f"amount is already booked."
-                    )
-                )
-
-            limit = vehicle_weight_limit(
-                vehicle_id
-            )
-
-            if (
-                limit is not None
-                and maximum > limit
-            ):
-                raise ValueError(
-                    f"This vehicle can carry at most {limit} kg."
-                )
-
-            db.execute(
-                """
-                UPDATE departure
-                SET departure_datetime = %s,
-                    maximum_weight_kg = %s
-                WHERE departure_id = %s
-                """,
-                (
-                    when,
-                    maximum,
-                    departure_id
-                )
-            )
-
-            messagebox.showinfo(
-                "Updated",
-                (
-                    f"Departure {departure_id} "
-                    f"was updated."
-                )
-            )
-
-            show_carrier_departures(
-                account_id,
-                display_name
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Update Departure Failed",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Update Departure",
-        command=update,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack()
-
-
-# =========================================================
-# CARRIER - POST SCAN
-# =========================================================
-
-def show_post_scan(account_id, display_name):
-    clear_root()
-
-    create_title("Post Scan Event")
-
-    _, shipments = db.query(
-        """
-        SELECT DISTINCT
-            s.shipment_id
-        FROM booking b
-        JOIN shipment s
-            ON s.shipment_id = b.shipment_id
-        JOIN departure d
-            ON d.departure_id = b.departure_id
-        JOIN vehicle v
-            ON v.vehicle_id = d.vehicle_id
-        WHERE v.carrier_id = %s
-        ORDER BY s.shipment_id
-        """,
-        (account_id,)
-    )
-
-    shipment_ids = [
-        str(row[0])
-        for row in shipments
-    ]
-
-    hubs = get_hubs()
-
-    form = ttk.Frame(root)
-    form.pack(pady=15)
-
-    ttk.Label(
-        form,
-        text="Shipment"
-    ).grid(
-        row=0,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    shipment_box = ttk.Combobox(
-        form,
-        values=shipment_ids,
-        state="readonly",
-        width=25
-    )
-    shipment_box.grid(row=0, column=1)
-
-    ttk.Label(
-        form,
-        text="Hub"
-    ).grid(
-        row=1,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    hub_box = ttk.Combobox(
-        form,
-        values=hubs,
-        state="readonly",
-        width=25
-    )
-    hub_box.grid(row=1, column=1)
-
-    ttk.Label(
-        form,
-        text="Status"
-    ).grid(
-        row=2,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    status_box = ttk.Combobox(
-        form,
-        values=[
-            "RECEIVED",
-            "IN_TRANSIT",
-            "ARRIVED_AT_HUB",
-            "OUT_FOR_DELIVERY",
-            "DELIVERED"
-        ],
-        state="readonly",
-        width=25
-    )
-    status_box.grid(row=2, column=1)
-
-    ttk.Label(
-        form,
-        text="Timestamp"
-    ).grid(
-        row=3,
-        column=0,
-        padx=10,
-        pady=8
-    )
-
-    time_entry = ttk.Entry(
-        form,
-        width=28
-    )
-    time_entry.grid(row=3, column=1)
-
-    time_entry.insert(
-        0,
-        datetime.now().strftime(
-            "%Y-%m-%d %H:%M"
-        )
-    )
-
-    ttk.Label(
-        root,
-        text="Format: YYYY-MM-DD HH:MM"
-    ).pack()
-
-    def post():
-        sid = shipment_box.get()
-        hub = hub_box.get()
-        status = status_box.get()
-
-        if not all(
-            (
-                sid,
-                hub,
-                status,
-                time_entry.get().strip()
-            )
-        ):
-            messagebox.showwarning(
-                "Missing Information",
-                "Fill out every field."
-            )
-            return
-
-        try:
-            when = valid_datetime(
-                time_entry.get().strip()
-            )
-
-            db.execute(
-                """
-                INSERT INTO scan_event (
-                    shipment_id,
-                    scan_sequence_no,
-                    scan_timestamp,
-                    hub_id,
-                    status
-                )
-                SELECT
-                    %s,
-                    COALESCE(
-                        MAX(scan_sequence_no),
-                        0
-                    ) + 1,
-                    %s,
-                    %s,
-                    %s
-                FROM scan_event
-                WHERE shipment_id = %s
-                """,
-                (
-                    sid,
-                    when,
-                    hub,
-                    status,
-                    sid
-                )
-            )
-
-            _, updated = db.query(
-                """
-                SELECT
-                    current_status,
-                    COALESCE(
-                        delivery_outcome,
-                        '-'
-                    )
-                FROM shipment
-                WHERE shipment_id = %s
-                """,
-                (sid,)
-            )
-
-            messagebox.showinfo(
-                "Scan Posted",
-                (
-                    f"Scan added successfully.\n\n"
-                    f"Current Status: "
-                    f"{updated[0][0]}\n"
-                    f"Delivery Outcome: "
-                    f"{updated[0][1]}"
-                )
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Scan Rejected",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Post Scan",
-        command=post,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack()
-
-
-# =========================================================
-# CARRIER - REPORTS
-# =========================================================
-
-def show_carrier_reports(account_id, display_name):
-    clear_root()
-
-    create_title("Carrier Reports")
-
-    _, summary = db.query(
-        """
-        SELECT
-            COUNT(*) AS delivered,
-            COALESCE(
-                SUM(
-                    s.delivery_outcome = 'ON_TIME'
-                ),
-                0
-            ),
-            COALESCE(
-                SUM(
-                    s.delivery_outcome = 'LATE'
-                ),
-                0
-            ),
-            ROUND(
-                100 *
-                SUM(
-                    s.delivery_outcome = 'ON_TIME'
-                ) /
-                NULLIF(COUNT(*), 0),
-                1
-            )
-        FROM shipment s
-        JOIN booking b
-            ON b.shipment_id = s.shipment_id
-        JOIN departure d
-            ON d.departure_id = b.departure_id
-        JOIN vehicle v
-            ON v.vehicle_id = d.vehicle_id
-        WHERE v.carrier_id = %s
-          AND s.delivery_outcome IS NOT NULL
-        """,
-        (account_id,)
-    )
-
-    delivered, on_time, late, pct = summary[0]
-
-    ttk.Label(
-        root,
-        text=(
-            f"Delivered: {delivered}     "
-            f"On Time: {on_time}     "
-            f"Late: {late}     "
-            f"On-Time Rate: "
-            f"{pct if pct is not None else '-'}%"
-        ),
-        font=("Arial", 12, "bold")
-    ).pack(pady=15)
-
-    _, rows = db.query(
-        """
-        SELECT
-            l.departure_id,
-            l.origin_hub_id,
-            l.destination_hub_id,
-            l.booked_weight_kg,
-            l.maximum_weight_kg,
-            l.utilization_pct
-        FROM v_departure_load l
-        JOIN vehicle v
-            ON v.vehicle_id = l.vehicle_id
-        WHERE v.carrier_id = %s
-        ORDER BY l.departure_id
-        """,
-        (account_id,)
-    )
-
-    frame = ttk.Frame(root)
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=20,
-        pady=10
-    )
-
-    tree = create_tree(
-        frame,
-        (
-            "dep",
-            "origin",
-            "dest",
-            "booked",
-            "max",
-            "util"
-        ),
-        (
-            "Departure",
-            "Origin",
-            "Destination",
-            "Booked kg",
-            "Max kg",
-            "Utilization %"
-        ),
-        (80, 80, 90, 100, 100, 110)
-    )
-
-    for row in rows:
-        tree.insert(
-            "",
-            "end",
-            values=row
-        )
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_carrier_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack(pady=15)
-
-
-# =========================================================
-# VIEWER DASHBOARD
-# =========================================================
-
-def show_viewer_dashboard(account_id, display_name):
-    clear_root()
-
-    create_title(
-        f"Welcome, {display_name}",
-        "Viewer Dashboard"
-    )
-
-    ttk.Button(
-        root,
-        text="Track Shipment",
-        command=lambda: show_viewer_tracking(
-            account_id,
-            display_name
-        ),
-        width=30
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="Performance Reports",
-        command=lambda: show_viewer_reports(
-            account_id,
-            display_name
-        ),
-        width=30
-    ).pack(pady=10)
-
-    ttk.Button(
-        root,
-        text="Logout",
-        command=show_home,
-        width=30
-    ).pack(pady=20)
-
-
-# =========================================================
-# VIEWER - TRACK
-# =========================================================
-
-def show_viewer_tracking(account_id, display_name):
-    clear_root()
-
-    create_title("Track Shipment")
-
-    ttk.Label(
-        root,
-        text="Shipment ID"
-    ).pack(pady=5)
-
-    entry = ttk.Entry(
-        root,
-        width=25
-    )
-    entry.pack()
-
-    info_label = ttk.Label(
-        root,
-        text="",
-        justify="left"
-    )
-    info_label.pack(pady=10)
-
-    frame = ttk.Frame(root)
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=20,
-        pady=15
-    )
-
-    tree = create_tree(
-        frame,
-        (
-            "seq",
-            "time",
-            "hub",
-            "status"
-        ),
-        (
-            "Seq",
-            "Timestamp",
-            "Hub",
-            "Status"
-        ),
-        (60, 180, 80, 150)
-    )
-
-    def track():
-        shipment_id = entry.get().strip()
-
-        if not shipment_id:
-            messagebox.showwarning(
-                "Shipment ID",
-                "Enter a shipment ID."
-            )
-            return
-
-        try:
-            _, shipment = db.query(
-                """
-                SELECT
-                    s.shipment_id,
-                    sh.shipper_name,
-                    s.origin_hub_id,
-                    s.destination_hub_id,
-                    s.weight_kg,
-                    s.promised_delivery_date,
-                    COALESCE(
-                        s.current_status,
-                        'NO SCANS'
-                    ),
-                    COALESCE(
-                        s.delivery_outcome,
-                        '-'
-                    )
-                FROM shipment s
-                JOIN shipper sh
-                    ON sh.account_id = s.shipper_id
-                WHERE s.shipment_id = %s
-                """,
-                (shipment_id,)
-            )
-
-            if not shipment:
-                messagebox.showerror(
-                    "Not Found",
-                    "No shipment exists with that ID."
-                )
+            text = w["did"][0].get().strip()
+            if not text.isdigit():
                 return
-
-            row = shipment[0]
-
-            info_label.config(
-                text=(
-                    f"Shipment: {row[0]}\n"
-                    f"Shipper: {row[1]}\n"
-                    f"Route: {row[2]} → {row[3]}\n"
-                    f"Weight: {row[4]} kg\n"
-                    f"Promised: {row[5]}\n"
-                    f"Current Status: {row[6]}\n"
-                    f"Outcome: {row[7]}"
-                )
-            )
-
-            for item in tree.get_children():
-                tree.delete(item)
-
             _, rows = db.query(
-                """
-                SELECT
-                    scan_sequence_no,
-                    scan_timestamp,
-                    hub_id,
-                    status
-                FROM scan_event
-                WHERE shipment_id = %s
-                ORDER BY scan_sequence_no
-                """,
-                (shipment_id,)
-            )
+                "SELECT l.vehicle_id, l.origin_hub_id, l.destination_hub_id, l.departure_datetime, "
+                "l.maximum_weight_kg FROM v_departure_load l JOIN vehicle v ON v.vehicle_id = l.vehicle_id "
+                "WHERE l.departure_id = %s AND v.carrier_id = %s", (int(text), me["id"]))
+            if rows:
+                for key, value in zip(("vid", "origin", "dest", "when", "cap"), rows[0]):
+                    set_entry(w[key][0], value)
+        except tk.TclError:
+            pass
 
-            for row in rows:
-                tree.insert(
-                    "",
-                    "end",
-                    values=row
-                )
+    w["did"][0].bind("<FocusOut>", prefill)
 
-        except Exception as e:
-            messagebox.showerror(
-                "Tracking Error",
-                str(e)
-            )
+    def save():
+        try:
+            v = read_form(w)
+            if v["origin"] == v["dest"]:
+                raise ValueError("Origin and destination hubs must be different.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
 
-    ttk.Button(
-        root,
-        text="Track",
-        command=track,
-        width=25
-    ).pack(pady=10)
+        def action():
+            _, rows = db.query(
+                "SELECT l.origin_hub_id, l.destination_hub_id, l.booked_weight_kg FROM v_departure_load l "
+                "JOIN vehicle v ON v.vehicle_id = l.vehicle_id WHERE l.departure_id = %s AND v.carrier_id = %s",
+                (v["did"], me["id"]))
+            if not rows:
+                raise Rejected("That departure does not exist or is not operated by your carrier account.")
+            old_origin, old_dest, booked = rows[0]
+            if not owns_vehicle(v["vid"]):
+                raise Rejected("That vehicle does not exist or is not owned by your carrier account.")
+            if v["cap"] < booked:
+                raise Rejected(f"Capacity cannot be lowered below the {booked} kg already booked.")
+            if booked > 0 and (v["origin"] != old_origin or v["dest"] != old_dest):
+                raise Rejected("The lane cannot be changed once shipments are booked on this departure.")
+            limit = vehicle_weight_limit(v["vid"])
+            if limit is not None and v["cap"] > limit:
+                raise Rejected(f"This vehicle can carry at most {limit} kg.")
+            db.execute("UPDATE departure SET vehicle_id = %s, origin_hub_id = %s, destination_hub_id = %s, "
+                       "departure_datetime = %s, maximum_weight_kg = %s WHERE departure_id = %s",
+                       (v["vid"], v["origin"], v["dest"], v["when"], v["cap"], v["did"]))
+            return f"Departure {v['did']} was updated."
+        run_action(action, "Departure Updated", "Update Departure Failed", carrier_departures_menu)
 
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_viewer_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack(pady=10)
+    action_bar([("Save", save), ("Cancel", carrier_departures_menu), ("LandingPage", carrier_landing)])
 
 
-# =========================================================
-# VIEWER - PERFORMANCE REPORTS
-# =========================================================
+# ---------- scans ----------
 
-def show_viewer_reports(account_id, display_name):
+def carrier_post_scan():
     clear_root()
+    create_title("Post Scan Event")
+    w = build_form([("sid", "Shipment ID", "id"), ("did", "Departure ID", "id"),
+                    ("when", "Timestamp (YYYY-MM-DD HH:MM)", "datetime", datetime.now().strftime("%Y-%m-%d %H:%M")),
+                    ("hub", "Hub ID", "hub"),
+                    ("status", "Status", "choice", "", list(STATUS_CHOICES))])
+    note("Hubs: " + ", ".join(get_hubs()))
+    note("Shipments booked on your departures", bold=True)
+    table(("sid", "dep", "origin", "dest", "status"),
+          ("Shipment", "Departure", "Origin", "Destination", "Current Status"), (90, 90, 80, 100, 160),
+          db.query("SELECT s.shipment_id, b.departure_id, s.origin_hub_id, s.destination_hub_id, "
+                   "COALESCE(s.current_status, 'NO SCANS YET') FROM booking b "
+                   "JOIN shipment s ON s.shipment_id = b.shipment_id "
+                   "JOIN departure d ON d.departure_id = b.departure_id "
+                   "JOIN vehicle v ON v.vehicle_id = d.vehicle_id WHERE v.carrier_id = %s "
+                   "ORDER BY s.shipment_id", (me["id"],))[1], height=6)
 
-    create_title("Published Performance Reports")
+    def save():
+        try:
+            v = read_form(w)
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+            return
 
-    notebook = ttk.Notebook(root)
-    notebook.pack(
-        fill="both",
-        expand=True,
-        padx=20,
-        pady=10
-    )
+        def action():
+            if not db.query("SELECT 1 FROM departure d JOIN vehicle v ON v.vehicle_id = d.vehicle_id "
+                            "WHERE d.departure_id = %s AND v.carrier_id = %s", (v["did"], me["id"]))[1]:
+                raise Rejected("That departure does not exist or is not operated by your carrier account.")
+            if not db.query("SELECT 1 FROM booking WHERE shipment_id = %s AND departure_id = %s",
+                            (v["sid"], v["did"]))[1]:
+                raise Rejected(f"Shipment {v['sid']} is not booked on departure {v['did']}, "
+                               f"so you are not authorized to scan it.")
+            status = STATUS_CHOICES[v["status"]]
+            # Next sequence number is computed inside the INSERT; the database triggers enforce
+            # chronology / status order and update the shipment's status and on-time flag.
+            db.execute("INSERT INTO scan_event (shipment_id, scan_sequence_no, scan_timestamp, hub_id, status) "
+                       "SELECT %s, COALESCE(MAX(scan_sequence_no), 0) + 1, %s, %s, %s "
+                       "FROM scan_event WHERE shipment_id = %s",
+                       (v["sid"], v["when"], v["hub"], status, v["sid"]))
+            _, r = db.query("SELECT current_status, COALESCE(delivery_outcome, '-') FROM shipment "
+                            "WHERE shipment_id = %s", (v["sid"],))
+            return f"Scan recorded.\nShipment {v['sid']} status: {r[0][0]}   Outcome: {r[0][1]}"
+        run_action(action, "Scan Posted", "Scan Rejected", carrier_landing)
 
-    lane_tab = ttk.Frame(notebook)
-    carrier_tab = ttk.Frame(notebook)
+    action_bar([("Save", save), ("Cancel", carrier_landing), ("LandingPage", carrier_landing)])
 
-    notebook.add(
-        lane_tab,
-        text="By Lane"
-    )
 
-    notebook.add(
-        carrier_tab,
-        text="By Carrier"
-    )
+# ---------- carrier reports ----------
 
-    _, lane_rows = db.query(
-        """
-        SELECT
-            origin_hub_id,
-            destination_hub_id,
-            COUNT(*) AS delivered,
-            SUM(
-                delivery_outcome = 'ON_TIME'
-            ) AS on_time,
-            SUM(
-                delivery_outcome = 'LATE'
-            ) AS late,
-            ROUND(
-                100 *
-                SUM(
-                    delivery_outcome = 'ON_TIME'
-                ) /
-                COUNT(*),
-                1
-            ) AS on_time_pct
-        FROM shipment
-        WHERE delivery_outcome IS NOT NULL
-        GROUP BY
-            origin_hub_id,
-            destination_hub_id
-        ORDER BY
-            origin_hub_id,
-            destination_hub_id
-        """
-    )
+def carrier_reports_menu():
+    menu_page("Reports", "Carrier: Reports", [
+        ("Load per Departure", carrier_load_report),
+        ("Carrier On-Time Rate", carrier_ontime_report),
+        ("Carrier Shipment Dwell Time", carrier_dwell_report),
+        ("GoBack", carrier_landing),
+        ("LandingPage", carrier_landing),
+    ])
 
-    lane_tree = create_tree(
-        lane_tab,
-        (
-            "origin",
-            "dest",
-            "delivered",
-            "ontime",
-            "late",
-            "pct"
-        ),
-        (
-            "Origin",
-            "Destination",
-            "Delivered",
-            "On Time",
-            "Late",
-            "On-Time %"
-        ),
-        (90, 100, 90, 90, 80, 100)
-    )
 
-    for row in lane_rows:
-        lane_tree.insert(
-            "",
-            "end",
-            values=row
-        )
+def carrier_load_report():
+    def run(v):
+        start, end = date_range(v)
+        _, rows = db.query(
+            "SELECT l.departure_id, l.origin_hub_id, l.destination_hub_id, l.departure_datetime, "
+            "l.maximum_weight_kg, l.booked_weight_kg, l.remaining_kg, l.utilization_pct "
+            "FROM v_departure_load l JOIN vehicle v ON v.vehicle_id = l.vehicle_id "
+            "WHERE v.carrier_id = %s AND DATE(l.departure_datetime) BETWEEN %s AND %s "
+            "ORDER BY l.departure_datetime", (me["id"], start, end))
+        return rows, f"{len(rows)} departure(s) between {start} and {end}"
+    report_page("Load per Departure", DATE_SPECS, run,
+                ("id", "origin", "dest", "time", "cap", "booked", "remaining", "pct"),
+                ("Departure", "Origin", "Destination", "Date/Time", "Capacity kg", "Booked kg",
+                 "Remaining kg", "Percent Full"), (80, 70, 90, 150, 100, 90, 100, 100),
+                carrier_reports_menu, carrier_landing)
 
-    _, carrier_rows = db.query(
-        """
-        SELECT
-            c.account_id,
-            c.carrier_name,
-            COUNT(*) AS delivered,
-            SUM(
-                s.delivery_outcome = 'ON_TIME'
-            ) AS on_time,
-            SUM(
-                s.delivery_outcome = 'LATE'
-            ) AS late,
-            ROUND(
-                100 *
-                SUM(
-                    s.delivery_outcome = 'ON_TIME'
-                ) /
-                COUNT(*),
-                1
-            ) AS on_time_pct
-        FROM shipment s
-        JOIN booking b
-            ON b.shipment_id = s.shipment_id
-        JOIN departure d
-            ON d.departure_id = b.departure_id
-        JOIN vehicle v
-            ON v.vehicle_id = d.vehicle_id
-        JOIN carrier c
-            ON c.account_id = v.carrier_id
-        WHERE s.delivery_outcome IS NOT NULL
-        GROUP BY
-            c.account_id,
-            c.carrier_name
-        ORDER BY c.account_id
-        """
-    )
 
-    carrier_tree = create_tree(
-        carrier_tab,
-        (
-            "id",
-            "name",
-            "delivered",
-            "ontime",
-            "late",
-            "pct"
-        ),
-        (
-            "Carrier ID",
-            "Carrier",
-            "Delivered",
-            "On Time",
-            "Late",
-            "On-Time %"
-        ),
-        (90, 190, 90, 90, 80, 100)
-    )
+def carrier_ontime_report():
+    def run(v):
+        start, end = date_range(v)
+        _, rows = db.query(
+            "SELECT COUNT(*), COALESCE(SUM(s.delivery_outcome = 'ON_TIME'), 0), "
+            "COALESCE(SUM(s.delivery_outcome = 'LATE'), 0) FROM shipment s "
+            "JOIN scan_event e ON e.shipment_id = s.shipment_id AND e.status = 'DELIVERED' "
+            "JOIN booking b ON b.shipment_id = s.shipment_id "
+            "JOIN departure d ON d.departure_id = b.departure_id "
+            "JOIN vehicle v ON v.vehicle_id = d.vehicle_id "
+            "WHERE v.carrier_id = %s AND DATE(e.scan_timestamp) BETWEEN %s AND %s",
+            (me["id"], start, end))
+        delivered, on_time, late = rows[0]
+        if not delivered:
+            return [], "No delivered shipments in this date range."
+        rate = round(100 * float(on_time) / delivered, 1)
+        return [(delivered, on_time, late, f"{rate}%")], f"On-time delivery rate {start} to {end}: {rate}%"
+    report_page("Carrier On-Time Rate", DATE_SPECS, run,
+                ("delivered", "ontime", "late", "rate"),
+                ("Delivered", "On Time", "Late", "On-Time Rate"), (120, 120, 120, 140),
+                carrier_reports_menu, carrier_landing)
 
-    for row in carrier_rows:
-        carrier_tree.insert(
-            "",
-            "end",
-            values=row
-        )
 
-    ttk.Button(
-        root,
-        text="Back",
-        command=lambda: show_viewer_dashboard(
-            account_id,
-            display_name
-        ),
-        width=25
-    ).pack(pady=12)
+def carrier_dwell_report():
+    def run(v):
+        if not db.query("SELECT 1 FROM booking b JOIN departure d ON d.departure_id = b.departure_id "
+                        "JOIN vehicle v ON v.vehicle_id = d.vehicle_id "
+                        "WHERE b.shipment_id = %s AND v.carrier_id = %s", (v["sid"], me["id"]))[1]:
+            raise Rejected("Your carrier account did not handle that shipment (or it does not exist).")
+        _, rows = db.query(DWELL_SQL, (v["sid"],))
+        return rows, f"Scan history of shipment {v['sid']}: {len(rows)} scan(s)"
+    report_page("Carrier Shipment Dwell Time", [("sid", "Shipment ID", "id")], run, *DWELL_COLS,
+                carrier_reports_menu, carrier_landing)
 
 
 # =========================================================
-# REQUIRED ANALYTICAL QUERIES
+# VIEWER (read-only: only SELECT statements below)
+# =========================================================
+
+def viewer_landing():
+    menu_page(f"Welcome, {me['name']}", "Viewer: Landing", [
+        ("Track Shipment", viewer_track),
+        ("Published Performance Reports", viewer_reports_menu),
+        ("Logout", show_home),
+    ])
+
+
+def viewer_track():
+    tracking_page("Track Shipment", False, viewer_landing, viewer_landing)
+
+
+def viewer_reports_menu():
+    menu_page("Published Performance Reports", "Viewer: Published Performance Reports", [
+        ("On-Time Rates by Lane", viewer_ontime_by_lane),
+        ("On-Time Rates by Carrier", viewer_ontime_by_carrier),
+        ("Lane Volume Ranking", viewer_lane_volume),
+        ("Top Departures per Lane", viewer_top_departures),
+        ("Shipment Dwell Time", viewer_dwell),
+        ("Running Total Deliveries by Carrier", viewer_running_total),
+        ("At-Risk In-Transit Shipments", viewer_at_risk),
+        ("GoBack", viewer_landing),
+        ("LandingPage", viewer_landing),
+    ])
+
+
+def viewer_ontime_by_lane():
+    def run(v):
+        start, end = date_range(v)
+        _, rows = db.query(
+            "SELECT s.origin_hub_id, s.destination_hub_id, COUNT(*), SUM(s.delivery_outcome = 'ON_TIME'), "
+            "SUM(s.delivery_outcome = 'LATE'), ROUND(100 * SUM(s.delivery_outcome = 'ON_TIME') / COUNT(*), 1), "
+            "ROUND(100 * SUM(s.delivery_outcome = 'LATE') / COUNT(*), 1) FROM shipment s "
+            "JOIN scan_event e ON e.shipment_id = s.shipment_id AND e.status = 'DELIVERED' "
+            "WHERE DATE(e.scan_timestamp) BETWEEN %s AND %s "
+            "GROUP BY s.origin_hub_id, s.destination_hub_id ORDER BY s.origin_hub_id, s.destination_hub_id",
+            (start, end))
+        return rows, f"Deliveries completed {start} to {end}, grouped by lane"
+    report_page("On-Time Rates by Lane", DATE_SPECS, run,
+                ("o", "d", "n", "on", "late", "onp", "lp"),
+                ("Origin", "Destination", "Delivered", "On Time", "Late", "On-Time %", "Late %"),
+                (90, 110, 90, 90, 80, 100, 90), viewer_reports_menu, viewer_landing)
+
+
+def viewer_ontime_by_carrier():
+    def run(v):
+        start, end = date_range(v)
+        _, rows = db.query(
+            "SELECT RANK() OVER (ORDER BY t.on_time_pct DESC), t.account_id, t.carrier_name, t.delivered, "
+            "t.on_time, t.late, t.on_time_pct FROM ("
+            "SELECT c.account_id, c.carrier_name, COUNT(*) AS delivered, "
+            "SUM(s.delivery_outcome = 'ON_TIME') AS on_time, SUM(s.delivery_outcome = 'LATE') AS late, "
+            "ROUND(100 * SUM(s.delivery_outcome = 'ON_TIME') / COUNT(*), 1) AS on_time_pct FROM shipment s "
+            "JOIN scan_event e ON e.shipment_id = s.shipment_id AND e.status = 'DELIVERED' "
+            "JOIN booking b ON b.shipment_id = s.shipment_id "
+            "JOIN departure d ON d.departure_id = b.departure_id "
+            "JOIN vehicle v ON v.vehicle_id = d.vehicle_id JOIN carrier c ON c.account_id = v.carrier_id "
+            "WHERE DATE(e.scan_timestamp) BETWEEN %s AND %s GROUP BY c.account_id, c.carrier_name) t "
+            "ORDER BY 1, t.account_id", (start, end))
+        return rows, f"Carriers ranked by on-time rate, deliveries {start} to {end}"
+    report_page("On-Time Rates by Carrier", DATE_SPECS, run,
+                ("rank", "id", "name", "n", "on", "late", "pct"),
+                ("Rank", "Carrier ID", "Carrier", "Delivered", "On Time", "Late", "On-Time %"),
+                (60, 90, 220, 90, 90, 80, 100), viewer_reports_menu, viewer_landing)
+
+
+def viewer_lane_volume():
+    def run(v):
+        start, end = date_range(v)
+        _, rows = db.query(
+            "SELECT RANK() OVER (ORDER BY SUM(weight_kg) DESC), origin_hub_id, destination_hub_id, COUNT(*), "
+            "SUM(weight_kg) FROM shipment WHERE promised_delivery_date BETWEEN %s AND %s "
+            "GROUP BY origin_hub_id, destination_hub_id ORDER BY 1, origin_hub_id, destination_hub_id",
+            (start, end))
+        return rows, f"Lanes ranked by total shipment weight (promised delivery date {start} to {end})"
+    report_page("Lane Volume Ranking", DATE_SPECS, run,
+                ("rank", "o", "d", "n", "kg"), ("Rank", "Origin", "Destination", "Shipments", "Total kg"),
+                (70, 100, 120, 100, 120), viewer_reports_menu, viewer_landing)
+
+
+def viewer_top_departures():
+    def run(v):
+        start, end = date_range(v)
+        _, rows = db.query(
+            "SELECT * FROM (SELECT origin_hub_id, destination_hub_id, departure_id, departure_datetime, "
+            "booked_weight_kg, maximum_weight_kg, utilization_pct, RANK() OVER (PARTITION BY origin_hub_id, "
+            "destination_hub_id ORDER BY booked_weight_kg DESC) AS lane_rank FROM v_departure_load "
+            "WHERE DATE(departure_datetime) BETWEEN %s AND %s) r WHERE lane_rank <= %s "
+            "ORDER BY origin_hub_id, destination_hub_id, lane_rank, departure_id", (start, end, v["n"]))
+        return rows, f"Top {v['n']} departures per lane by booked load, {start} to {end}"
+    report_page("Top Departures per Lane", DATE_SPECS + [("n", "Top N", "id", "3")], run,
+                ("o", "d", "dep", "time", "booked", "max", "pct", "rank"),
+                ("Origin", "Destination", "Departure", "Date/Time", "Booked kg", "Capacity kg", "Percent Full",
+                 "Rank"), (70, 90, 80, 150, 90, 100, 100, 60), viewer_reports_menu, viewer_landing)
+
+
+def viewer_dwell():
+    def run(v):
+        _, rows = db.query(DWELL_SQL, (v["sid"],))
+        if not rows:
+            raise Rejected("That shipment does not exist or has no scan events.")
+        return rows, f"Scan history of shipment {v['sid']}: {len(rows)} scan(s)"
+    report_page("Shipment Dwell Time", [("sid", "Shipment ID", "id")], run, *DWELL_COLS,
+                viewer_reports_menu, viewer_landing)
+
+
+def viewer_running_total():
+    def run(v):
+        start, end = date_range(v)
+        cid = v["cid"]
+        if cid is not None and not db.query("SELECT 1 FROM carrier WHERE account_id = %s", (cid,))[1]:
+            raise ValueError(f"Carrier ID {cid} does not exist.")
+        _, rows = db.query(
+            "WITH w AS (SELECT v.carrier_id, DATE_SUB(DATE(e.scan_timestamp), INTERVAL WEEKDAY(e.scan_timestamp) DAY) "
+            "AS week_start, COUNT(*) AS delivered FROM scan_event e "
+            "JOIN booking b ON b.shipment_id = e.shipment_id "
+            "JOIN departure d ON d.departure_id = b.departure_id JOIN vehicle v ON v.vehicle_id = d.vehicle_id "
+            "WHERE e.status = 'DELIVERED' AND DATE(e.scan_timestamp) BETWEEN %s AND %s "
+            "AND (%s IS NULL OR v.carrier_id = %s) GROUP BY v.carrier_id, week_start) "
+            "SELECT w.carrier_id, c.carrier_name, w.week_start, w.delivered, SUM(w.delivered) OVER "
+            "(PARTITION BY w.carrier_id ORDER BY w.week_start ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+            "FROM w JOIN carrier c ON c.account_id = w.carrier_id ORDER BY w.carrier_id, w.week_start",
+            (start, end, cid, cid))
+        return rows, f"Cumulative delivered shipments by week, {start} to {end}"
+    report_page("Running Total Deliveries by Carrier",
+                DATE_SPECS + [("cid", "Carrier ID (optional)", "id_opt")], run,
+                ("id", "name", "week", "n", "total"),
+                ("Carrier ID", "Carrier", "Week Starting", "Delivered That Week", "Running Total"),
+                (90, 220, 120, 150, 120), viewer_reports_menu, viewer_landing)
+
+
+def viewer_at_risk():
+    def run(v):
+        _, rows = db.query(
+            "SELECT s.shipment_id, sh.shipper_name, s.origin_hub_id, s.destination_hub_id, "
+            "COALESCE(s.current_status, 'NO SCANS YET'), s.promised_delivery_date, "
+            "DATEDIFF(s.promised_delivery_date, CURDATE()) FROM shipment s "
+            "JOIN shipper sh ON sh.account_id = s.shipper_id "
+            "WHERE (s.current_status IS NULL OR s.current_status <> 'DELIVERED') "
+            "AND s.promised_delivery_date <= DATE_ADD(CURDATE(), INTERVAL %s DAY) "
+            "ORDER BY s.promised_delivery_date, s.shipment_id", (v["n"],))
+        return rows, f"{len(rows)} in-transit shipment(s) overdue or due within {v['n']} day(s)"
+    report_page("At-Risk In-Transit Shipments", [("n", "N Days", "n", "7")], run,
+                ("id", "shipper", "o", "d", "status", "promised", "days"),
+                ("Shipment", "Shipper", "Origin", "Destination", "Status", "Promised", "Days to Promise"),
+                (80, 190, 70, 100, 140, 110, 120), viewer_reports_menu, viewer_landing)
+
+
+# =========================================================
+# VIEW QUERIES (root menu, the 6 required analytical queries, numbered as in the handout)
 # =========================================================
 
 def show_queries_menu():
-    clear_root()
-
-    create_title(
-        "Required Analytical Queries",
-        "Select a query to run"
-    )
-
-    options = [
-        (
-            "1. Vehicle counts by carrier/type",
-            query1
-        ),
-        (
-            "2. Departure utilization ranking by lane",
-            query2_prompt
-        ),
-        (
-            "3. Shipment dwell times",
-            query3_prompt
-        ),
-        (
-            "4. Running delivered weight by carrier",
-            query4
-        ),
-        (
-            "5. Multi-shipper departures",
-            query5
-        ),
-        (
-            "6. Shipments with no scans",
-            query6
-        )
-    ]
-
-    for label, command in options:
-        ttk.Button(
-            root,
-            text=label,
-            command=command,
-            width=48
-        ).pack(pady=8)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=show_home,
-        width=25
-    ).pack(pady=20)
+    menu_page("View Queries", "Select a query to run", [
+        ("Number of vehicles of each type per carrier", query1),
+        ("Departures ranked by weight utilization per lane", query2),
+        ("Dwell time between consecutive scans of a shipment", query3),
+        ("Running total of delivered weight by week per carrier", query4),
+        ("Departures carrying shipments of 2+ different shippers", query5),
+        ("Shipments with no scan events", query6),
+        ("Back", show_home),
+    ])
 
 
-def show_query_result(
-    title,
-    columns,
-    headings,
-    rows,
-    widths=None
-):
-    show_rows(
-        title,
-        columns,
-        headings,
-        rows,
-        widths,
-        show_queries_menu
-    )
+def query_page(heading, specs, run, columns, headings, widths):
+    report_page(heading, specs, run, columns, headings, widths, show_queries_menu, show_home,
+                run_label="Run Query", back_label="Back", landing_label="Home")
 
-
-# =========================================================
-# QUERY 1
-# =========================================================
 
 def query1():
-    try:
+    def run(v):
         _, rows = db.query(
-            """
-            SELECT
-                c.account_id,
-                c.carrier_name,
-                v.vehicle_type,
-                COUNT(*) AS vehicle_count
-            FROM carrier c
-            JOIN vehicle v
-                ON v.carrier_id = c.account_id
-            GROUP BY
-                c.account_id,
-                c.carrier_name,
-                v.vehicle_type
-            ORDER BY
-                c.account_id,
-                v.vehicle_type
-            """
-        )
-
-        show_query_result(
-            "Query 1 - Vehicle Counts",
-            (
-                "id",
-                "carrier",
-                "type",
-                "count"
-            ),
-            (
-                "Carrier ID",
-                "Carrier",
-                "Type",
-                "Vehicle Count"
-            ),
-            rows,
-            (90, 220, 180, 110)
-        )
-
-    except Exception as e:
-        messagebox.showerror(
-            "Query Error",
-            str(e)
-        )
+            "SELECT c.account_id, c.carrier_name, v.vehicle_type, COUNT(*) FROM carrier c "
+            "JOIN vehicle v ON v.carrier_id = c.account_id GROUP BY c.account_id, c.carrier_name, v.vehicle_type "
+            "ORDER BY c.account_id, v.vehicle_type")
+        return rows, ""
+    query_page("Query 1 - Vehicles per Type per Carrier", [], run,
+               ("id", "name", "type", "n"), ("Carrier ID", "Carrier", "Vehicle Type", "Vehicle Count"),
+               (90, 230, 180, 120))
 
 
-# =========================================================
-# QUERY 2
-# =========================================================
-
-def query2_prompt():
-    clear_root()
-
-    create_title(
-        "Query 2",
-        "Rank departures by utilization within each lane"
-    )
-
-    ttk.Label(
-        root,
-        text="Top N departures per lane"
-    ).pack(pady=10)
-
-    entry = ttk.Entry(
-        root,
-        width=20
-    )
-    entry.pack()
-
-    entry.insert(
-        0,
-        "5"
-    )
-
-    def run():
-        try:
-            n = int(
-                entry.get().strip()
-            )
-
-            if n <= 0:
-                raise ValueError(
-                    "N must be greater than 0."
-                )
-
-            _, rows = db.query(
-                """
-                SELECT *
-                FROM (
-                    SELECT
-                        origin_hub_id,
-                        destination_hub_id,
-                        departure_id,
-                        departure_datetime,
-                        booked_weight_kg,
-                        maximum_weight_kg,
-                        utilization_pct,
-                        RANK() OVER (
-                            PARTITION BY
-                                origin_hub_id,
-                                destination_hub_id
-                            ORDER BY
-                                utilization_pct DESC
-                        ) AS lane_rank
-                    FROM v_departure_load
-                ) ranked
-                WHERE lane_rank <= %s
-                ORDER BY
-                    origin_hub_id,
-                    destination_hub_id,
-                    lane_rank,
-                    departure_id
-                """,
-                (n,)
-            )
-
-            show_query_result(
-                "Query 2 - Utilization Rankings",
-                (
-                    "origin",
-                    "dest",
-                    "dep",
-                    "time",
-                    "booked",
-                    "max",
-                    "util",
-                    "rank"
-                ),
-                (
-                    "Origin",
-                    "Destination",
-                    "Departure",
-                    "Date/Time",
-                    "Booked",
-                    "Maximum",
-                    "Utilization %",
-                    "Rank"
-                ),
-                rows,
-                (
-                    70,
-                    90,
-                    80,
-                    150,
-                    80,
-                    80,
-                    100,
-                    60
-                )
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Query Error",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Run Query",
-        command=run,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=show_queries_menu,
-        width=25
-    ).pack()
+def query2():
+    def run(v):
+        top = v["n"] if v["n"] else 10 ** 9
+        _, rows = db.query(
+            "SELECT * FROM (SELECT origin_hub_id, destination_hub_id, departure_id, departure_datetime, "
+            "booked_weight_kg, maximum_weight_kg, utilization_pct, RANK() OVER (PARTITION BY origin_hub_id, "
+            "destination_hub_id ORDER BY utilization_pct DESC) AS lane_rank FROM v_departure_load) r "
+            "WHERE lane_rank <= %s ORDER BY origin_hub_id, destination_hub_id, lane_rank, departure_id", (top,))
+        return rows, "Rank 1 = most heavily loaded departure on the lane"
+    query_page("Query 2 - Departures Ranked by Utilization per Lane", [("n", "Top N per lane (blank = all)", "id_opt")],
+               run, ("o", "d", "dep", "time", "booked", "max", "util", "rank"),
+               ("Origin", "Destination", "Departure", "Date/Time", "Booked kg", "Capacity kg", "Utilization %",
+                "Rank"), (70, 90, 80, 150, 90, 100, 110, 60))
 
 
-# =========================================================
-# QUERY 3
-# =========================================================
+def query3():
+    def run(v):
+        _, rows = db.query(DWELL_SQL, (v["sid"],))
+        return rows, f"Scan history of shipment {v['sid']}"
+    query_page("Query 3 - Time Between Consecutive Scans", [("sid", "Shipment ID", "id")], run, *DWELL_COLS)
 
-def query3_prompt():
-    clear_root()
-
-    create_title(
-        "Query 3",
-        "Time between consecutive scan events"
-    )
-
-    ttk.Label(
-        root,
-        text="Shipment ID"
-    ).pack(pady=10)
-
-    entry = ttk.Entry(
-        root,
-        width=20
-    )
-    entry.pack()
-
-    def run():
-        shipment_id = entry.get().strip()
-
-        if not shipment_id:
-            messagebox.showwarning(
-                "Shipment ID",
-                "Enter a shipment ID."
-            )
-            return
-
-        try:
-            _, rows = db.query(
-                """
-                SELECT
-                    shipment_id,
-                    scan_sequence_no,
-                    status,
-                    hub_id,
-                    scan_timestamp,
-                    LAG(scan_timestamp)
-                        OVER w
-                        AS previous_scan_time,
-                    LAG(hub_id)
-                        OVER w
-                        AS previous_hub,
-                    TIMESTAMPDIFF(
-                        MINUTE,
-                        LAG(scan_timestamp)
-                            OVER w,
-                        scan_timestamp
-                    )
-                        AS minutes_since_previous,
-                    ROUND(
-                        TIMESTAMPDIFF(
-                            MINUTE,
-                            LAG(scan_timestamp)
-                                OVER w,
-                            scan_timestamp
-                        ) / 60,
-                        2
-                    )
-                        AS hours_since_previous
-                FROM scan_event
-                WHERE shipment_id = %s
-                WINDOW w AS (
-                    PARTITION BY shipment_id
-                    ORDER BY scan_sequence_no
-                )
-                ORDER BY scan_sequence_no
-                """,
-                (shipment_id,)
-            )
-
-            show_query_result(
-                "Query 3 - Shipment Dwell Times",
-                (
-                    "shipment",
-                    "seq",
-                    "status",
-                    "hub",
-                    "time",
-                    "prevtime",
-                    "prevhub",
-                    "minutes",
-                    "hours"
-                ),
-                (
-                    "Shipment",
-                    "Seq",
-                    "Status",
-                    "Hub",
-                    "Timestamp",
-                    "Previous Time",
-                    "Previous Hub",
-                    "Minutes",
-                    "Hours"
-                ),
-                rows,
-                (
-                    70,
-                    50,
-                    130,
-                    60,
-                    150,
-                    150,
-                    90,
-                    80,
-                    70
-                )
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Query Error",
-                str(e)
-            )
-
-    ttk.Button(
-        root,
-        text="Run Query",
-        command=run,
-        width=25
-    ).pack(pady=15)
-
-    ttk.Button(
-        root,
-        text="Back",
-        command=show_queries_menu,
-        width=25
-    ).pack()
-
-
-# =========================================================
-# QUERY 4
-# =========================================================
 
 def query4():
-    try:
+    def run(v):
         _, rows = db.query(
-            """
-            WITH delivered AS (
-                SELECT
-                    v.carrier_id,
-                    DATE_SUB(
-                        DATE(sc.scan_timestamp),
-                        INTERVAL
-                            WEEKDAY(sc.scan_timestamp)
-                            DAY
-                    ) AS week_start,
-                    s.weight_kg
-                FROM scan_event sc
-                JOIN shipment s
-                    ON s.shipment_id =
-                       sc.shipment_id
-                JOIN booking b
-                    ON b.shipment_id =
-                       s.shipment_id
-                JOIN departure d
-                    ON d.departure_id =
-                       b.departure_id
-                JOIN vehicle v
-                    ON v.vehicle_id =
-                       d.vehicle_id
-                WHERE sc.status = 'DELIVERED'
-            ),
-            weekly AS (
-                SELECT
-                    carrier_id,
-                    week_start,
-                    SUM(weight_kg)
-                        AS delivered_kg
-                FROM delivered
-                GROUP BY
-                    carrier_id,
-                    week_start
-            )
-            SELECT
-                w.carrier_id,
-                c.carrier_name,
-                w.week_start,
-                w.delivered_kg,
-                SUM(w.delivered_kg)
-                    OVER (
-                        PARTITION BY w.carrier_id
-                        ORDER BY w.week_start
-                        ROWS BETWEEN
-                            UNBOUNDED PRECEDING
-                            AND CURRENT ROW
-                    )
-                    AS cumulative_delivered_kg
-            FROM weekly w
-            JOIN carrier c
-                ON c.account_id =
-                   w.carrier_id
-            ORDER BY
-                w.carrier_id,
-                w.week_start
-            """
-        )
+            "WITH delivered AS (SELECT v.carrier_id, DATE_SUB(DATE(sc.scan_timestamp), "
+            "INTERVAL WEEKDAY(sc.scan_timestamp) DAY) AS week_start, s.weight_kg FROM scan_event sc "
+            "JOIN shipment s ON s.shipment_id = sc.shipment_id JOIN booking b ON b.shipment_id = s.shipment_id "
+            "JOIN departure d ON d.departure_id = b.departure_id JOIN vehicle v ON v.vehicle_id = d.vehicle_id "
+            "WHERE sc.status = 'DELIVERED'), weekly AS (SELECT carrier_id, week_start, SUM(weight_kg) AS "
+            "delivered_kg FROM delivered GROUP BY carrier_id, week_start) "
+            "SELECT w.carrier_id, c.carrier_name, w.week_start, w.delivered_kg, SUM(w.delivered_kg) OVER "
+            "(PARTITION BY w.carrier_id ORDER BY w.week_start ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+            "FROM weekly w JOIN carrier c ON c.account_id = w.carrier_id ORDER BY w.carrier_id, w.week_start")
+        return rows, "Delivered weight per week (weeks start Monday) with running total"
+    query_page("Query 4 - Running Delivered Weight by Carrier", [], run,
+               ("id", "name", "week", "kg", "total"),
+               ("Carrier ID", "Carrier", "Week Starting", "Delivered kg", "Running Total kg"),
+               (90, 230, 120, 120, 140))
 
-        show_query_result(
-            "Query 4 - Running Delivered Weight",
-            (
-                "carrier",
-                "name",
-                "week",
-                "weekkg",
-                "total"
-            ),
-            (
-                "Carrier ID",
-                "Carrier",
-                "Week",
-                "Delivered kg",
-                "Running Total"
-            ),
-            rows,
-            (90, 220, 110, 110, 120)
-        )
-
-    except Exception as e:
-        messagebox.showerror(
-            "Query Error",
-            str(e)
-        )
-
-
-# =========================================================
-# QUERY 5
-# =========================================================
 
 def query5():
-    try:
+    def run(v):
         _, rows = db.query(
-            """
-            SELECT
-                b.departure_id,
-                COUNT(
-                    DISTINCT s.shipper_id
-                ) AS distinct_shippers
-            FROM booking b
-            JOIN shipment s
-                ON s.shipment_id =
-                   b.shipment_id
-            GROUP BY b.departure_id
-            HAVING COUNT(
-                DISTINCT s.shipper_id
-            ) >= 2
-            ORDER BY b.departure_id
-            """
-        )
+            "SELECT b.departure_id, COUNT(DISTINCT s.shipper_id) FROM booking b "
+            "JOIN shipment s ON s.shipment_id = b.shipment_id GROUP BY b.departure_id "
+            "HAVING COUNT(DISTINCT s.shipper_id) >= 2 ORDER BY b.departure_id")
+        return rows, ""
+    query_page("Query 5 - Departures with 2+ Different Shippers", [], run,
+               ("dep", "n"), ("Departure ID", "Distinct Shippers"), (160, 180))
 
-        show_query_result(
-            "Query 5 - Multi-Shipper Departures",
-            (
-                "departure",
-                "count"
-            ),
-            (
-                "Departure",
-                "Distinct Shippers"
-            ),
-            rows,
-            (150, 160)
-        )
-
-    except Exception as e:
-        messagebox.showerror(
-            "Query Error",
-            str(e)
-        )
-
-
-# =========================================================
-# QUERY 6
-# =========================================================
 
 def query6():
-    try:
+    def run(v):
         _, rows = db.query(
-            """
-            SELECT
-                s.shipment_id,
-                s.shipper_id,
-                sh.shipper_name,
-                s.origin_hub_id,
-                s.destination_hub_id,
-                s.promised_delivery_date
-            FROM shipment s
-            JOIN shipper sh
-                ON sh.account_id =
-                   s.shipper_id
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM scan_event e
-                WHERE e.shipment_id =
-                      s.shipment_id
-            )
-            ORDER BY s.shipment_id
-            """
-        )
-
-        show_query_result(
-            "Query 6 - Shipments With No Scans",
-            (
-                "shipment",
-                "shipper",
-                "name",
-                "origin",
-                "dest",
-                "promised"
-            ),
-            (
-                "Shipment",
-                "Shipper ID",
-                "Shipper",
-                "Origin",
-                "Destination",
-                "Promised"
-            ),
-            rows,
-            (90, 90, 220, 80, 100, 110)
-        )
-
-    except Exception as e:
-        messagebox.showerror(
-            "Query Error",
-            str(e)
-        )
+            "SELECT s.shipment_id, s.shipper_id, sh.shipper_name, s.origin_hub_id, s.destination_hub_id, "
+            "s.promised_delivery_date FROM shipment s JOIN shipper sh ON sh.account_id = s.shipper_id "
+            "WHERE NOT EXISTS (SELECT 1 FROM scan_event e WHERE e.shipment_id = s.shipment_id) "
+            "ORDER BY s.shipment_id")
+        return rows, ""
+    query_page("Query 6 - Shipments With No Scan Events", [], run,
+               ("id", "shipper", "name", "o", "d", "promised"),
+               ("Shipment ID", "Shipper ID", "Shipper", "Origin", "Destination", "Promised Delivery"),
+               (100, 100, 220, 80, 110, 130))
 
 
 # =========================================================
 # START APPLICATION
 # =========================================================
 
-root = tk.Tk()
+def main():
+    global root
+    root = tk.Tk()
+    root.title("Freight Tracking and Delivery Management")
+    root.geometry("1100x750")
+    root.minsize(900, 650)
+    try:
+        db.query("SELECT 1")
+    except Exception as e:
+        messagebox.showerror("Cannot Connect to the Database", err_text(e))
+        root.destroy()
+        return
+    show_home()
+    root.mainloop()
 
-root.title(
-    "Freight Tracking and Delivery Management"
-)
 
-root.geometry(
-    "1100x750"
-)
-
-root.minsize(
-    900,
-    650
-)
-
-show_home()
-
-root.mainloop()
+if __name__ == "__main__":
+    main()
