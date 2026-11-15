@@ -87,7 +87,7 @@ def note(text, bold=False):
 def action_bar(buttons):
     """Numbered buttons exactly like the flow document: '1. Save', '2. Cancel', ..."""
     for i, (label, command) in enumerate(buttons, 1):
-        ttk.Button(root, text=f"{i}. {label}", command=command, width=30).pack(pady=3)
+        ttk.Button(root, text=f"{label}", command=command, width=30).pack(pady=3)
 
 
 def menu_page(heading, subtitle, items):
@@ -277,8 +277,36 @@ def tracking_page(heading, owner_only, back, landing):
     clear_root()
     create_title(heading)
     widgets = build_form([("sid", "Shipment ID", "id")])
-    info = ttk.Label(root, text="", justify="left", font=("Arial", 11))
-    info.pack(pady=8)
+
+    # Shipment details heading
+    ttk.Label(
+        root,
+        text="Shipment Details",
+        font=("Arial", 13, "bold")
+    ).pack(pady=(10, 4))
+
+    # Container for shipment information
+    info_frame = ttk.Frame(root)
+    info_frame.pack(padx=20, pady=4, anchor="w")
+
+    info_labels = {}
+    fields = ["Shipment ID:", "Shipper:", "Route:", "Weight:",
+            "Promised Delivery:", "Current Status:", "Delivery Outcome:"]
+
+    for i, field in enumerate(fields):
+        ttk.Label(
+            info_frame,
+            text=field,
+            font=("Arial", 10, "bold")
+        ).grid(row=i, column=0, sticky="w", padx=(0, 10), pady=2)
+
+        info_labels[field] = ttk.Label(
+            info_frame,
+            text="",
+            font=("Arial", 10)
+        )
+        info_labels[field].grid(row=i, column=1, sticky="w", pady=2)
+
     tree = table(("seq", "time", "hub", "status"), ("Seq", "Timestamp", "Hub", "Status"), (60, 190, 80, 170), height=6)
 
     # Show all shipment IDs belonging to the logged-in shipper.
@@ -326,14 +354,22 @@ def tracking_page(heading, owner_only, back, landing):
         try:
             _, rows = db.query(sql, params)
             if not rows:
-                info.config(text="")
+                for label in info_labels.values():
+                    label.config(text="")
                 fill_tree(tree, [])
                 messagebox.showerror("Not Found", "That shipment does not exist"
                                      + (" or is not owned by you." if owner_only else "."))
                 return
             r = rows[0]
-            info.config(text=(f"Shipment {r[0]}   Shipper: {r[1]}\nRoute: {r[2]} -> {r[3]}   Weight: {r[4]} kg\n"
-                              f"Promised: {r[5]}\nCurrent Status: {r[6]}   Delivery Outcome: {r[7]}"))
+
+            info_labels["Shipment ID:"].config(text=r[0])
+            info_labels["Shipper:"].config(text=r[1])
+            info_labels["Route:"].config(text=f"{r[2]} -> {r[3]}")
+            info_labels["Weight:"].config(text=f"{r[4]} kg")
+            info_labels["Promised Delivery:"].config(text=r[5])
+            info_labels["Current Status:"].config(text=r[6])
+            info_labels["Delivery Outcome:"].config(text=r[7])
+
             _, scans = db.query("SELECT scan_sequence_no, scan_timestamp, hub_id, status FROM scan_event "
                                 "WHERE shipment_id = %s ORDER BY scan_sequence_no", (v["sid"],))
             fill_tree(tree, scans)
