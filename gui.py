@@ -279,7 +279,35 @@ def tracking_page(heading, owner_only, back, landing):
     widgets = build_form([("sid", "Shipment ID", "id")])
     info = ttk.Label(root, text="", justify="left", font=("Arial", 11))
     info.pack(pady=8)
-    tree = table(("seq", "time", "hub", "status"), ("Seq", "Timestamp", "Hub", "Status"), (60, 190, 80, 170))
+    tree = table(("seq", "time", "hub", "status"), ("Seq", "Timestamp", "Hub", "Status"), (60, 190, 80, 170), height=6)
+
+    # Show all shipment IDs belonging to the logged-in shipper.
+    if owner_only:
+        try:
+            _, shipment_rows = db.query(
+                "SELECT shipment_id FROM shipment "
+                "WHERE shipper_id = %s ORDER BY shipment_id",
+                (me["id"],)
+            )
+
+            shipment_ids = [str(row[0]) for row in shipment_rows]
+
+            ids_text = (
+                "Available Shipment IDs: " + ", ".join(shipment_ids)
+                if shipment_ids
+                else "You have not created any shipments yet."
+            )
+
+            ttk.Label(
+                root,
+                text=ids_text,
+                wraplength=900,
+                justify="left",
+                font=("Arial", 10, "bold")
+            ).pack(padx=20, pady=(8, 4), fill="x")
+
+        except Exception as e:
+            messagebox.showerror("Database Error", err_text(e))
 
     def view():
         try:
