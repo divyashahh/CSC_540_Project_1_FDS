@@ -1,12 +1,5 @@
 # CSC 540 Project 1 — Freight Tracking and Delivery Management
 
-## Team Members
-
-- Divya Shah — dbshah5
-- Lasya Banka — lbanka
-- Madhu Gopinath — mgopina
-- Nimra Shaik — nshaik2
-
 ## Project Overview
 
 This project implements a freight tracking and delivery management system using:
@@ -26,9 +19,9 @@ The application also includes the six required analytical queries.
 
 ---
 
-# Setup Instructions
+## Setup Instructions
 
-## 1. Clone the Repository
+### 1. Clone the Repository
 
 Open a terminal and run:
 
@@ -45,9 +38,7 @@ git pull
 
 to make sure you have the latest version.
 
----
-
-## 2. Connect to the NC State VPN
+### 2. Connect to the NC State VPN
 
 The MariaDB server is only accessible from the NC State network.
 
@@ -67,9 +58,7 @@ Port:
 
 DBeaver does **not** need to remain open while using the application. It is only needed if you want to manually inspect the database or load/reload the SQL files.
 
----
-
-## 3. Install Python
+### 3. Install Python
 
 Make sure Python 3 is installed.
 
@@ -85,9 +74,7 @@ On some systems, the command may be:
 python3 --version
 ```
 
----
-
-## 4. Install the Required Python Package
+### 4. Install the Required Python Package
 
 From the project directory, run:
 
@@ -97,9 +84,7 @@ pip install mysql-connector-python
 
 Tkinter is part of the standard Python installation on Windows and normally does not require a separate installation.
 
----
-
-## 5. Create `config.py`
+### 5. Create `config.py`
 
 The repository contains:
 
@@ -143,7 +128,7 @@ DB_CONFIG = {
 
 ---
 
-# Database Setup
+## Database Setup
 
 The database only needs to be initialized before the first run, or whenever the schema/sample data need to be reset.
 
@@ -165,7 +150,7 @@ queries.sql
 - `sample_data.sql` populates the database with the project sample data.
 - `queries.sql` contains the six required analytical queries.
 
-## Option A — DBeaver
+### Option A — DBeaver
 
 1. Connect to the MariaDB server using:
 
@@ -223,9 +208,7 @@ It also contains the supporting departure-load view.
 
 DBeaver can be closed after this setup is complete.
 
----
-
-## Option B — MariaDB / MySQL Shell
+### Option B — MariaDB / MySQL Shell
 
 The SQL files can also be loaded directly through the NC State database shell.
 
@@ -244,7 +227,7 @@ SHOW TABLES;
 
 ---
 
-# Test the Database Connection
+## Test the Database Connection
 
 Before launching the GUI, you can verify the connection by running:
 
@@ -265,7 +248,7 @@ If the connection fails, check:
 
 ---
 
-# Run the Application
+## Run the Application
 
 From the root project directory, run:
 
@@ -281,15 +264,15 @@ DBeaver does **not** need to be open.
 
 ---
 
-# Sample Login Accounts
+## Demo Login Accounts
 
-All sample accounts use the password:
+All demo accounts use the password:
 
 ```text
 password123
 ```
 
-## Shipper Accounts
+### Shipper Accounts
 
 ```text
 triangle
@@ -305,7 +288,7 @@ Username: triangle
 Password: password123
 ```
 
-## Carrier Accounts
+### Carrier Accounts
 
 ```text
 piedmont
@@ -320,7 +303,7 @@ Username: piedmont
 Password: password123
 ```
 
-## Viewer Account
+### Viewer Account
 
 ```text
 fedex
@@ -335,9 +318,9 @@ Password: password123
 
 ---
 
-# Application Features
+## Application Features
 
-## Shipper
+### Shipper
 
 The Shipper interface allows users to:
 
@@ -351,7 +334,7 @@ The Shipper interface allows users to:
 
 Shippers are restricted to their own shipments.
 
-## Carrier
+### Carrier
 
 The Carrier interface allows users to:
 
@@ -368,7 +351,7 @@ The Carrier interface allows users to:
 
 Carriers can only manage vehicles and departures belonging to their own carrier account and can only scan shipments assigned to departures they operate.
 
-## Viewer
+### Viewer
 
 The Viewer interface is read-only and includes:
 
@@ -381,7 +364,7 @@ The Viewer interface is read-only and includes:
 - Running delivery totals by carrier
 - At-risk in-transit shipments
 
-## Required Analytical Queries
+### Required Analytical Queries
 
 The application includes the six required analytical queries:
 
@@ -394,7 +377,7 @@ The application includes the six required analytical queries:
 
 ---
 
-# Project Structure
+## Project Structure
 
 ```text
 CSC_540_Project_1_FDS/
@@ -415,18 +398,16 @@ CSC_540_Project_1_FDS/
 │   ├── viewer.py
 │   └── view_queries.py
 │
-├── sql/
-│   ├── schema.sql
-│   ├── sample_data.sql
-│   ├── queries.sql
-│   └── test_queries.sql
-│
-└── DEMO_CHECKLIST.txt
+└── sql/
+    ├── schema.sql
+    ├── sample_data.sql
+    ├── queries.sql
+    └── test_queries.sql
 ```
 
 ---
 
-# Important Notes
+## Important Notes
 
 - Connect to the NC State VPN when off campus.
 - DBeaver is optional after the database has been initialized.
@@ -434,3 +415,10 @@ CSC_540_Project_1_FDS/
 - Do not commit `config.py`.
 - The application connects directly to MariaDB through Python using `mysql-connector-python`.
 - If the database has been reset, rerun `schema.sql` and then `sample_data.sql` before starting the application.
+
+### Team Members
+
+- Divya Shah — dbshah5
+- Lasya Banka — lbanka
+- Madhu Gopinath — mgopina
+- Nimra Shaik — nshaik2
