@@ -25,6 +25,7 @@ COLORS = {
     "value": "#76323F",
     "white": "#FFFFFF",
     "border": "#D7CEC7",
+    "container": "#DAD8D3",
     "selected": "#D7CEC7"
 }
 
@@ -92,6 +93,21 @@ def apply_theme():
         fieldbackground=COLORS["white"],
         foreground=COLORS["text"],
         padding=5
+    )
+
+    # Shipment detail labels
+    style.configure(
+        "Detail.TLabel",
+        background=COLORS["container"],
+        foreground=COLORS["text"],
+        font=("Arial", 10, "bold")
+    )
+
+    style.configure(
+        "Value.TLabel",
+        background=COLORS["container"],
+        foreground=COLORS["value"],
+        font=("Arial", 10)
     )
 
     # Tables
@@ -348,7 +364,7 @@ DATE_SPECS = [("start", "Start Date (YYYY-MM-DD)", "date", "2026-01-01"),
 
 
 def report_page(heading, specs, run, columns, headings, widths, back, landing,
-                run_label="View Report", back_label="GoBack", landing_label="LandingPage"):
+                run_label="View Report", back_label="Go Back", landing_label="Landing Page"):
     """Form -> run(values) -> (rows, summary text) shown below. With no form fields the report
     is shown immediately and only the navigation buttons remain (as in the flow document)."""
     clear_root()
@@ -419,33 +435,42 @@ def tracking_page(heading, owner_only, back, landing):
 
     tree = table(("seq", "time", "hub", "status"), ("Seq", "Timestamp", "Hub", "Status"), (60, 190, 80, 170), height=6)
 
-    # Show all shipment IDs belonging to the logged-in shipper.
-    if owner_only:
-        try:
-            _, shipment_rows = db.query(
+    # Show available shipment IDs.
+    try:
+        if owner_only:
+            # Shipper: show only their own shipment IDs.
+            query = (
                 "SELECT shipment_id FROM shipment "
-                "WHERE shipper_id = %s ORDER BY shipment_id",
-                (me["id"],)
+                "WHERE shipper_id = %s ORDER BY shipment_id"
             )
-
-            shipment_ids = [str(row[0]) for row in shipment_rows]
-
-            ids_text = (
-                "Available Shipment IDs: " + ", ".join(shipment_ids)
-                if shipment_ids
-                else "You have not created any shipments yet."
+            params = (me["id"],)
+        else:
+            # Viewer: show all shipment IDs.
+            query = (
+                "SELECT shipment_id FROM shipment "
+                "ORDER BY shipment_id"
             )
+            params = ()
 
-            ttk.Label(
-                root,
-                text=ids_text,
-                wraplength=900,
-                justify="left",
-                font=("Arial", 10, "bold")
-            ).pack(padx=20, pady=(8, 4), fill="x")
+        _, shipment_rows = db.query(query, params)
+        shipment_ids = [str(row[0]) for row in shipment_rows]
 
-        except Exception as e:
-            messagebox.showerror("Database Error", err_text(e))
+        ids_text = (
+            "Available Shipment IDs: " + ", ".join(shipment_ids)
+            if shipment_ids
+            else "No shipments are currently available."
+        )
+
+        ttk.Label(
+            root,
+            text=ids_text,
+            wraplength=900,
+            justify="left",
+            font=("Arial", 10, "bold")
+        ).pack(padx=20, pady=(8, 4), fill="x")
+
+    except Exception as e:
+        messagebox.showerror("Database Error", err_text(e))
 
     def view():
         try:
@@ -486,7 +511,7 @@ def tracking_page(heading, owner_only, back, landing):
         except Exception as e:
             messagebox.showerror("Tracking Error", err_text(e))
 
-    action_bar([("View History", view), ("GoBack", back), ("LandingPage", landing)])
+    action_bar([("View History", view), ("Go Back", back), ("Landing Page", landing)])
 
 
 DWELL_SQL = """
@@ -549,7 +574,7 @@ def show_login(role):
         landing()
 
     widgets["pw"][0].bind("<Return>", lambda e: sign_in())
-    action_bar([("Sign-In", sign_in), ("GoBack", show_home)])
+    action_bar([("Sign-In", sign_in), ("Go Back", show_home)])
 
 
 # =========================================================
@@ -580,8 +605,8 @@ def shipper_manage():
         ("Update Shipment", shipper_update),
         ("Book Shipment onto Departure", shipper_book),
         ("Track Shipment", shipper_track),
-        ("GoBack", shipper_landing),
-        ("LandingPage", shipper_landing),
+        ("Go Back", shipper_landing),
+        ("Landing Page", shipper_landing),
     ])
 
 
@@ -610,7 +635,7 @@ def shipper_create():
                     f"{v['weight']} kg, promised {v['promised']}.")
         run_action(action, "Shipment Created", "Create Shipment Failed", shipper_manage)
 
-    action_bar([("Save", save), ("Cancel", shipper_manage), ("LandingPage", shipper_landing)])
+    action_bar([("Save", save), ("Cancel", shipper_manage), ("Landing Page", shipper_landing)])
 
 
 def shipper_update():
@@ -660,7 +685,7 @@ def shipper_update():
             return f"Shipment {v['sid']} was updated."
         run_action(action, "Shipment Updated", "Update Shipment Failed", shipper_manage)
 
-    action_bar([("Save", save), ("Cancel", shipper_manage), ("LandingPage", shipper_landing)])
+    action_bar([("Save", save), ("Cancel", shipper_manage), ("Landing Page", shipper_landing)])
 
 
 def shipper_book():
@@ -705,7 +730,7 @@ def shipper_book():
             return f"Shipment {v['sid']} was booked onto departure {v['did']}.{load}"
         run_action(action, "Booking Successful", "Booking Rejected", shipper_manage)
 
-    action_bar([("Book", book), ("Cancel", shipper_manage), ("LandingPage", shipper_landing)])
+    action_bar([("Book", book), ("Cancel", shipper_manage), ("Landing Page", shipper_landing)])
 
 
 def shipper_track():
@@ -717,8 +742,8 @@ def shipper_reports_menu():
         ("On-Time vs Late Summary", shipper_ontime_report),
         ("In-Transit Shipments", shipper_intransit_report),
         ("Shipments Near Promise Date", shipper_near_promise_report),
-        ("GoBack", shipper_landing),
-        ("LandingPage", shipper_landing),
+        ("Go Back", shipper_landing),
+        ("Landing Page", shipper_landing),
     ])
 
 
@@ -809,8 +834,8 @@ def carrier_vehicles_menu():
         ("Add New Vehicle", carrier_add_vehicle),
         ("Update Vehicle", carrier_update_vehicle),
         ("View Vehicles", carrier_view_vehicles),
-        ("GoBack", carrier_landing),
-        ("LandingPage", carrier_landing),
+        ("Go Back", carrier_landing),
+        ("Landing Page", carrier_landing),
     ])
 
 
@@ -842,7 +867,7 @@ def carrier_add_vehicle():
             return
         carrier_add_vehicle_details(v["vid"], v["hub"], VEHICLE_TYPES[v["vtype"]])
 
-    action_bar([("Continue", cont), ("GoBack", carrier_vehicles_menu), ("LandingPage", carrier_landing)])
+    action_bar([("Continue", cont), ("Go Back", carrier_vehicles_menu), ("Landing Page", carrier_landing)])
 
 
 def carrier_add_vehicle_details(vid, hub, vtype):
@@ -875,7 +900,7 @@ def carrier_add_vehicle_details(vid, hub, vtype):
             return f"Vehicle {new_id} ({type_label(vtype)}) was added."
         run_action(action, "Vehicle Added", "Add Vehicle Failed", carrier_vehicles_menu)
 
-    action_bar([("Save", save), ("Cancel", carrier_add_vehicle), ("LandingPage", carrier_landing)])
+    action_bar([("Save", save), ("Cancel", carrier_add_vehicle), ("Landing Page", carrier_landing)])
 
 
 def carrier_update_vehicle():
@@ -905,7 +930,7 @@ def carrier_update_vehicle():
             carrier_update_type(v["vid"], vtype)
 
     action_bar([("Update Common Details", lambda: go("common")), ("Update Type Details", lambda: go("type")),
-                ("GoBack", carrier_vehicles_menu), ("LandingPage", carrier_landing)])
+                ("Go Back", carrier_vehicles_menu), ("Landing Page", carrier_landing)])
 
 
 def carrier_update_common(vid, hub):
@@ -927,7 +952,7 @@ def carrier_update_common(vid, hub):
             return f"Vehicle {vid} now has home hub {v['hub']}."
         run_action(action, "Vehicle Updated", "Update Vehicle Failed", carrier_vehicles_menu)
 
-    action_bar([("Save", save), ("Cancel", carrier_update_vehicle), ("LandingPage", carrier_landing)])
+    action_bar([("Save", save), ("Cancel", carrier_update_vehicle), ("Landing Page", carrier_landing)])
 
 
 def carrier_update_type(vid, vtype):
@@ -954,7 +979,7 @@ def carrier_update_type(vid, vtype):
             return f"Vehicle {vid} details were updated."
         run_action(action, "Vehicle Updated", "Update Vehicle Failed", carrier_vehicles_menu)
 
-    action_bar([("Save", save), ("Cancel", carrier_update_vehicle), ("LandingPage", carrier_landing)])
+    action_bar([("Save", save), ("Cancel", carrier_update_vehicle), ("Landing Page", carrier_landing)])
 
 
 # ---------- departures ----------
@@ -964,8 +989,8 @@ def carrier_departures_menu():
         ("Schedule Departure", carrier_schedule_departure),
         ("Update Departure", carrier_update_departure),
         ("View Departures", carrier_view_departures),
-        ("GoBack", carrier_landing),
-        ("LandingPage", carrier_landing),
+        ("Go Back", carrier_landing),
+        ("Landing Page", carrier_landing),
     ])
 
 
@@ -1031,7 +1056,7 @@ def carrier_schedule_departure():
             return f"Departure {new_id} was scheduled. Remaining capacity: {v['cap']} kg."
         run_action(action, "Departure Scheduled", "Schedule Departure Failed", carrier_departures_menu)
 
-    action_bar([("Save", save), ("Cancel", carrier_departures_menu), ("LandingPage", carrier_landing)])
+    action_bar([("Save", save), ("Cancel", carrier_departures_menu), ("Landing Page", carrier_landing)])
 
 
 def carrier_update_departure():
@@ -1093,7 +1118,7 @@ def carrier_update_departure():
             return f"Departure {v['did']} was updated."
         run_action(action, "Departure Updated", "Update Departure Failed", carrier_departures_menu)
 
-    action_bar([("Save", save), ("Cancel", carrier_departures_menu), ("LandingPage", carrier_landing)])
+    action_bar([("Save", save), ("Cancel", carrier_departures_menu), ("Landing Page", carrier_landing)])
 
 
 # ---------- scans ----------
@@ -1143,7 +1168,7 @@ def carrier_post_scan():
             return f"Scan recorded.\nShipment {v['sid']} status: {r[0][0]}   Outcome: {r[0][1]}"
         run_action(action, "Scan Posted", "Scan Rejected", carrier_landing)
 
-    action_bar([("Save", save), ("Cancel", carrier_landing), ("LandingPage", carrier_landing)])
+    action_bar([("Save", save), ("Cancel", carrier_landing), ("Landing Page", carrier_landing)])
 
 
 # ---------- carrier reports ----------
@@ -1153,8 +1178,8 @@ def carrier_reports_menu():
         ("Load per Departure", carrier_load_report),
         ("Carrier On-Time Rate", carrier_ontime_report),
         ("Carrier Shipment Dwell Time", carrier_dwell_report),
-        ("GoBack", carrier_landing),
-        ("LandingPage", carrier_landing),
+        ("Go Back", carrier_landing),
+        ("Landing Page", carrier_landing),
     ])
 
 
@@ -1235,8 +1260,8 @@ def viewer_reports_menu():
         ("Shipment Dwell Time", viewer_dwell),
         ("Running Total Deliveries by Carrier", viewer_running_total),
         ("At-Risk In-Transit Shipments", viewer_at_risk),
-        ("GoBack", viewer_landing),
-        ("LandingPage", viewer_landing),
+        ("Go Back", viewer_landing),
+        ("Landing Page", viewer_landing),
     ])
 
 
